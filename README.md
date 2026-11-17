@@ -13,6 +13,6 @@ Team Contract:
 
 ### Cliff sensor: 
 
-black: 50
-Normal gray: 2500
-White wall : 2800
+black: 50  
+Normal gray: 2500  
+White wall : 2800  
