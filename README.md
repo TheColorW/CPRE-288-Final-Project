@@ -9,3 +9,10 @@ Project Proposal:
 
 Team Contract:
 [Team-Contract-Labs.pdf](https://github.com/user-attachments/files/34757071/Team-Contract-Labs.pdf)
+
+
+### Cliff sensor: 
+
+black: 50
+Normal gray: 2500
+White wall : 2800
