@@ -10,6 +10,9 @@ Project Proposal:
 Team Contract:
 [Team-Contract-Labs.pdf](https://github.com/user-attachments/files/34757071/Team-Contract-Labs.pdf)
 
+OneNote:
+[CPRE 288 OneNote](https://iowastate-my.sharepoint.com/:o:/g/personal/jfr72506_iastate_edu/cgqZ7-slkmsOSY4dZTSK2nz-EgUDKggq7DODg80akjLrOWIeTg)
+
 
 ### Cliff sensor: 
 
