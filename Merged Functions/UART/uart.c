@@ -6,8 +6,7 @@
  *      Authors: carlos28, jfr72506, gm3vf
  */
 
-#include <stdint.h>
-#include <inc/tm4c123gh6pm.h>
+
 #include "timer.h"
 #include "uart.h"
 
