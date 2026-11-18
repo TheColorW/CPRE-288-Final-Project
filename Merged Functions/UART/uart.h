@@ -15,7 +15,7 @@
 #include <inc/tm4c123gh6pm.h>
 #include "driverlib/interrupt.h"
 
-// Volatiles for interrupts
+// Volatiles for interrupts (DECLARE IN MAIN)
 extern volatile char uart_data;
 extern volatile char flag;
 
@@ -32,7 +32,7 @@ void uart_sendStr(const char *data);
 char uart_receive();
 
 // Receive one char (nonblocking)
-char uart_receive_nonblock(char *data)
+char uart_receive_nonblock(char *data);
 
 // Initialize interrupts
 void uart_interrupt_init();
