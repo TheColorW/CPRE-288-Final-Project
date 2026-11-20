@@ -1,5 +1,10 @@
 # CPRE-288-Final-Project
 
+Helpful things:
+- 192.168.1.1
+- 288
+- cpre288psk
+
 ## The Galumphs
 
 
