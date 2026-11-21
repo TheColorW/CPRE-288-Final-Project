@@ -12,13 +12,14 @@
 #include <stdbool.h>
 #include <inc/tm4c123gh6pm.h>
 #include "driverlib/interrupt.h"
+#include "bno055.h"
 
 void I2C_init(void);
 
-static int I2C1_Wait_Done(void)
+static int I2C1_Wait_Done(void);
 
-int I2C1_Write(int sAddr, int rAddr, int data)
+int I2C1_Write(uint8_t sAddr, uint8_t rAddr, const uint8_t *data, uint8_t count);
 
-void I2C1_Read(int sAddr, uint8_t rAddr)
+int I2C1_Read(int sAddr, uint8_t rAddr, uint8_t *data, uint8_t count);
 
 #endif /* UART_H_ */

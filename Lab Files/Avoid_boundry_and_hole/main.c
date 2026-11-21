@@ -19,79 +19,113 @@
 #include "button.h"
 #include "open_interface.h"
 #include "movement.h"
+#include "i2c.h"
+#include "bno055.h"
+#include "init_imu.h"
+
+#define SOUTH_HEADING   180.0f
+#define HEADING_TOL     1.5f
+
 
 volatile int overflow_count;
 volatile int flag;
 volatile char uart_data;
 
+
+void wait_for_calibration(void);
+void turn_to_heading(oi_t *sensor_data, float target_deg);
+
+
 int main(void) {
     timer_init();
-    servo_init();
     lcd_init();
     button_init();
+
     oi_t *sensor_data = oi_alloc();
     oi_init(sensor_data);
 
+    // Initialize I2C1 + BNO055 and switch to 9-DOF sensor fusion
+    init_imu();
+    set_imu_mode(0x0C);
 
+    // Step 1: Calibrate (hold still 2s for Gyro, then spin 360 deg for Mag)
+    wait_for_calibration();
+
+    // Step 2: Rotate to face South
+    turn_to_heading(sensor_data, SOUTH_HEADING);
+
+    // Step 3: Drive forward using your existing movement function
     double cm_driven = move_forward_until_stop(sensor_data, 250, 150);
-
-    lcd_printf("Flag hit at %.lf\n because of Flag:%d",cm_driven, flag);
+    lcd_printf("Stopped at %.1f cm\nFlag: %d", cm_driven, flag);
 
     oi_free(sensor_data);
-
-//    volatile int flag;
-//
-//
-//    int turnDir = 0; // 0 = counterclockwise, 1 = clockwise
-//    float currentDegree = 90.0; // used for logic with sw1 and sw2 (90 is default)
-//    char message[20] = "counterclockwise"; // initial direction message
-//    servo_move(currentDegree); //initial degree to start
-//
-//    while(1)
-//        {
-//
-//            if(flag == 0){
-//                oi_update(sensor_data);
-//
-//            }
-//
-//            int leftColorSensor = sensor_data->cliffLeftSignal;
-//            int frontLeftColorSensor = sensor_data->cliffFrontLeftSignal;
-//            int rightColorSensor = sensor_data->cliffRightSignal;
-//            int frontRightColorSensor = sensor_data->cliffFrontRightSignal;
-//            //50 was black, 2500 was grey, and 2800 was white... rough estimates based on returned values
-//            //cybot1 grey: 1700 - 2000, White: 2650 - 2800
-//            lcd_printf("Left: %d\nRight: %d", frontLeftColorSensor, frontRightColorSensor);
-//
-//
-//            //Cybot is directly above border
-//             if((frontRightColorSensor > 2650 || frontRightColorSensor < 300) && (frontLeftColorSensor > 2650 || frontLeftColorSensor < 300)) {
-//                 lcd_printf("first- go back and turn counter");
-//                 move_backward(sensor_data, 10, 150);
-//                 turn_anticlockwise(sensor_data, 180);
-//             } else if(frontRightColorSensor > 2650 || frontRightColorSensor < 300) {
-//                 lcd_printf("second- turn counter");
-//                 turn_anticlockwise(sensor_data, 10);
-//             } else if(frontLeftColorSensor > 2650 || frontLeftColorSensor < 300) {
-//                 lcd_printf("third- turnr");
-//                 turn_clockwise(sensor_data, 10);
-//             }
-//
-//             lcd_printf("forward?");
-//
-//             double forwared = move_forward(sensor_data, 10, 150);
-//             oi_setWheels(0,0);
-//             lcd_printf("rescan with this val traveled %lf\n", forwared );
-//             oi_free(sensor_data);
-//             oi_update(sensor_data);
-//
-//        }
-
-
-
-
-    //servo_move(265.0); // 265 degrees for some reason is 180 w/ 1 at end of actual seconds
-                     // 0 is not 0, stops at ~30 to 45 degrees
-
-    //actual 0 is -50, actual 180 is ~265, actual 90 is 115 for cybot 01 (equation for cybot 1: y = 0.0097x + 0.7361)
+    return 0;
 }
+
+
+void wait_for_calibration(void){
+    Calibration cal;
+
+
+    while (1) {
+        cal = calibrate_imu();
+        lcd_printf("Calibrating IMU\nG:%d M:%d A:%d S:%d\nSW1 to override",
+                   cal.gyro, cal.magn, cal.accl, cal.syst);
+
+        // Gyro + Mag = 3 gives reliable compass heading on flat ground
+        if (cal.gyro == 3 && cal.magn == 3) {
+            break;
+        }
+
+        // Safety override: press SW1 if indoor metal keeps Mag at 2
+        if (cal.gyro == 3 && button_getButton() == 1) {
+            break;
+        }
+
+        timer_waitMillis(100);
+    }
+
+    lcd_printf("IMU Ready!\nStarting turn...");
+    timer_waitMillis(500);
+}
+
+void turn_to_heading(oi_t *sensor_data, float target_deg) {
+    float heading = 0.0f;
+    float error = 0.0f;
+    int16_t speed = 0;
+
+    while (1) {
+        // Read fused heading directly (0.0 to 360.0 deg, no quaternion.c needed)
+        bno055_convert_float_euler_h_deg(&heading);
+
+        // Compute shortest signed angle error in range [-180, +180]
+        error = target_deg - heading;
+        while (error > 180.0f)  error -= 360.0f;
+        while (error < -180.0f) error += 360.0f;
+
+        lcd_printf("Target: %.1f\nCurr:   %.1f\nErr:    %.1f",
+                   target_deg, heading, error);
+
+        // Stop once inside tolerance band
+        if (fabsf(error) <= HEADING_TOL) {
+            break;
+        }
+
+        // Two-stage speed control: fast turn when far, slow creep near target
+        speed = (fabsf(error) > 15.0f) ? 80 : 35;
+
+        if (error > 0.0f) {
+            // Need heading to increase -> turn clockwise
+            oi_setWheels(-speed, speed);
+        } else {
+            // Need heading to decrease -> turn counterclockwise
+            oi_setWheels(speed, -speed);
+        }
+
+        timer_waitMillis(15); // ~66 Hz update (BNO055 fuses at 100 Hz)
+    }
+
+    oi_setWheels(0, 0);
+    timer_waitMillis(150); // Let chassis settle before driving forward
+}
+

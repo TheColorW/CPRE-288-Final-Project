@@ -12,6 +12,7 @@
 #include <inc/tm4c123gh6pm.h>
 #include "i2c.h"
 #include "timer.h"
+#include "bno055.h"
 
 
 void I2C_init(void){
@@ -67,7 +68,7 @@ int I2C1_Write(uint8_t sAddr, uint8_t rAddr, const uint8_t *data, uint8_t count)
         if(i==count -1){
             I2C1_MCS_R = 0x05;
         }else{
-            I2C_MCS_R = 0x01;
+            I2C1_MCS_R = 0x01;
         }
         error = I2C1_Wait_Done();
         if(error){
@@ -81,7 +82,7 @@ int I2C1_Write(uint8_t sAddr, uint8_t rAddr, const uint8_t *data, uint8_t count)
     return 0;
 }
 
-int I2C1_Read(int sAddr, uint8_t rAddr, const uint8_t *data, uint8_t count){
+int I2C1_Read(int sAddr, uint8_t rAddr, uint8_t *data, uint8_t count){
     uint8_t error, i;
 
 
@@ -89,7 +90,7 @@ int I2C1_Read(int sAddr, uint8_t rAddr, const uint8_t *data, uint8_t count){
 
     I2C1_MSA_R = sAddr << 1;
     I2C1_MDR_R = rAddr;
-    I2C_MCS_R = 0x3; 
+    I2C1_MCS_R = 0x3;
     error = I2C1_Wait_Done();
     if(error){
         I2C1_MCS_R = 0x04;
@@ -102,7 +103,7 @@ int I2C1_Read(int sAddr, uint8_t rAddr, const uint8_t *data, uint8_t count){
         error = I2C1_Wait_Done();
         if(error) return -1;
 
-        data[0] = (uint8_t) I2C1_MDR_R;
+        data[0] = (uint8_t)(I2C1_MDR_R & 0xFF);
         error = I2C1_Wait_Done();
     }else {
         for (i = 0; i < count; i++) {
@@ -125,7 +126,7 @@ int I2C1_Read(int sAddr, uint8_t rAddr, const uint8_t *data, uint8_t count){
         }
     }
 
-        while(I2C_MCS_R &0x40);
+        while(I2C1_MCS_R &0x40);
         return 0; 
         
 }
