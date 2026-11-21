@@ -1,4 +1,4 @@
-/*
+ /*
  * main.c
  *
  *  Created on: Oct 29, 2026
@@ -18,9 +18,10 @@
 #include "servo.h"
 #include "button.h"
 #include "open_interface.h"
+#include "movement.h"
 
 volatile int overflow_count;
-volatile char flag;
+volatile int flag;
 volatile char uart_data;
 
 int main(void) {
@@ -32,38 +33,60 @@ int main(void) {
     oi_init(sensor_data);
 
 
-    int turnDir = 0; // 0 = counterclockwise, 1 = clockwise
-    float currentDegree = 90.0; // used for logic with sw1 and sw2 (90 is default)
-    char message[20] = "counterclockwise"; // initial direction message
-    servo_move(currentDegree); //initial degree to start
+    double cm_driven = move_forward_until_stop(sensor_data, 250, 150);
 
-    while(1)
-        {
+    lcd_printf("Flag hit at %.lf\n because of Flag:%d",cm_driven, flag);
 
-            int leftColorSensor = sensor_data->cliffLeftSignal;
-            int frontLeftColorSensor = sensor_data->cliffFrontLeftSignal;
-            int rightColorSensor = sensor_data->cliffRightSignal;
-            int frontRightColorSensor = sensor_data->cliffFrontRightSignal;
-            //50 was black, 2500 was grey, and 2800 was white... rough estimates based on returned values
-            //cybot1 grey: 1700 - 2000, White: 2650 - 2800
-            lcd_printf("Left: %d\nRight: %d", frontLeftColorSensor, frontRightColorSensor);
+    oi_free(sensor_data);
 
-            //Cybot is directly above border
-//            if((frontRightColorSensor > 2650 || frontRightColorSensor < 300) && (frontLeftColorSensor > 2650 || frontLeftColorSensor < 300)) {
-//                move_backward(sensor_data, 10);
-//                turn_counter_clockwise(sensor_data, 180);
-//            } else if(frontRightColorSensor > 2650 || frontRightColorSensor < 300) {
-//                turn_counter_clockwise(sensor_data, 10);
-//            } else if(frontLeftColorSensor > 2650 || frontLeftColorSensor < 300) {
-//                turn_clockwise(sensor_data, 10);
+//    volatile int flag;
+//
+//
+//    int turnDir = 0; // 0 = counterclockwise, 1 = clockwise
+//    float currentDegree = 90.0; // used for logic with sw1 and sw2 (90 is default)
+//    char message[20] = "counterclockwise"; // initial direction message
+//    servo_move(currentDegree); //initial degree to start
+//
+//    while(1)
+//        {
+//
+//            if(flag == 0){
+//                oi_update(sensor_data);
+//
 //            }
 //
-//            move_forward(sensor_data, 10);
-            oi_setWheels(0,0);
-            oi_free(sensor_data);
+//            int leftColorSensor = sensor_data->cliffLeftSignal;
+//            int frontLeftColorSensor = sensor_data->cliffFrontLeftSignal;
+//            int rightColorSensor = sensor_data->cliffRightSignal;
+//            int frontRightColorSensor = sensor_data->cliffFrontRightSignal;
+//            //50 was black, 2500 was grey, and 2800 was white... rough estimates based on returned values
+//            //cybot1 grey: 1700 - 2000, White: 2650 - 2800
+//            lcd_printf("Left: %d\nRight: %d", frontLeftColorSensor, frontRightColorSensor);
+//
+//
+//            //Cybot is directly above border
+//             if((frontRightColorSensor > 2650 || frontRightColorSensor < 300) && (frontLeftColorSensor > 2650 || frontLeftColorSensor < 300)) {
+//                 lcd_printf("first- go back and turn counter");
+//                 move_backward(sensor_data, 10, 150);
+//                 turn_anticlockwise(sensor_data, 180);
+//             } else if(frontRightColorSensor > 2650 || frontRightColorSensor < 300) {
+//                 lcd_printf("second- turn counter");
+//                 turn_anticlockwise(sensor_data, 10);
+//             } else if(frontLeftColorSensor > 2650 || frontLeftColorSensor < 300) {
+//                 lcd_printf("third- turnr");
+//                 turn_clockwise(sensor_data, 10);
+//             }
+//
+//             lcd_printf("forward?");
+//
+//             double forwared = move_forward(sensor_data, 10, 150);
+//             oi_setWheels(0,0);
+//             lcd_printf("rescan with this val traveled %lf\n", forwared );
+//             oi_free(sensor_data);
+//             oi_update(sensor_data);
+//
+//        }
 
-
-        }
 
 
 

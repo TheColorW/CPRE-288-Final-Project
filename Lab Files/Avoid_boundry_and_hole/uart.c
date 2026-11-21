@@ -92,7 +92,7 @@ void uart_interrupt_handler(){
     if((UART1_MIS_R & 0x10) != 0){ //step1
 
         uart_data = uart_receive(); //step2
-        flag = 1;
+        //flag = 1;
 
         UART1_ICR_R = 0x10; //step3
 

@@ -15,7 +15,7 @@
 
 // These are for interrupts
 extern volatile char uart_data; // declared in main
-extern volatile char flag;      // declared in main
+//extern volatile char flag;      // declared in main
 
 void uart_init(void);
 
