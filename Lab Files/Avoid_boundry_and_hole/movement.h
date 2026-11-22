@@ -34,7 +34,7 @@
 //       update CLIFF_DEST_MIN / CLIFF_DEST_MAX, then set ENABLE_DEST_DETECT to 1.
 #define ENABLE_DEST_DETECT    0
 #define CLIFF_DEST_MIN        400
-#define CLIFF_DEST_MAX        2100
+#define CLIFF_DEST_MAX        900
 
 // Distance calibration: raw oi_t->distance ticks (mm) per actual cm traveled.
 // Original code used (cm * 10 - 1.5 * cm) = 8.5 mm/cm. Tune on a 100 cm test drive.

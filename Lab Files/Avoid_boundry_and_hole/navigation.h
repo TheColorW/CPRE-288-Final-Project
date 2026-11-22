@@ -25,7 +25,7 @@
 // Top racks center Y = 231 (height 62 -> 200..262) => ARENA_HEIGHT_CM = 262.
 // TODO: Verify ARENA_WIDTH_CM with a tape measure (525 assumes symmetric
 //       left/right margins around x=182 and x=343: 182 + 343 = 525).
-#define ARENA_WIDTH_CM       525.0f
+#define ARENA_WIDTH_CM       462.0f
 #define ARENA_HEIGHT_CM      262.0f
 
 #define ROBOT_RADIUS_CM      17.0f
