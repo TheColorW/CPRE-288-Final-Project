@@ -4,6 +4,8 @@
  *   Created on: Aug 25, 2026
  *   Updated on: Nov 22, 2026
  *      Authors: carlos28, jfr72506, gm3vf, jjaritz
+ *
+ *   Encoder-primary movement & calibration with BNO055 IMUPLUS (0x08) redundancy.
  */
 
 #ifndef MOVEMENT_H_
@@ -11,7 +13,7 @@
 
 #include "open_interface.h"
 
-// Stop reason flags set by move_forward_until_stop / move_forward_imu
+// Stop reason flags set by move_forward_until_stop / move_forward_tracked
 #define MOVE_FLAG_NONE        0
 #define MOVE_FLAG_BUMP_LEFT   1
 #define MOVE_FLAG_WALL_LEFT   2
@@ -30,44 +32,59 @@
 #define CLIFF_HOLE_THRESH     120
 
 // Destination mat detection (paper on floor)
-// TODO: Use 'p' UART command to read cliff values on destination paper,
-//       update CLIFF_DEST_MIN / CLIFF_DEST_MAX, then set ENABLE_DEST_DETECT to 1.
+// TODO: Use 'p' UART command on destination paper, update MIN/MAX, set ENABLE to 1.
 #define ENABLE_DEST_DETECT    0
 #define CLIFF_DEST_MIN        400
-#define CLIFF_DEST_MAX        900
+#define CLIFF_DEST_MAX        2100
 
-// Distance calibration: raw oi_t->distance ticks (mm) per actual cm traveled.
-// Original code used (cm * 10 - 1.5 * cm) = 8.5 mm/cm. Tune on a 100 cm test drive.
-#define MM_PER_CM_CAL         8.5
+// Default calibration constants (also live-tunable over UART with 'k' commands!)
+// Run 't d 100' and 't a 90' / 't a -90' before test runs to verify accuracy.
+#define DEFAULT_MM_PER_CM_CAL     10.0f
+#define DEFAULT_ANGLE_SCALE_CW    1.00f
+#define DEFAULT_ANGLE_SCALE_CCW   1.00f
+#define DEFAULT_IMU_BLEND         0.20f  // 0.0 = pure encoders, 0.2 = 20% IMU sanity blend
+#define IMU_MAX_AGREE_DIFF_DEG    15.0f  // Ignore IMU on a turn if it disagrees by >15 deg
 
-// IMU turn control tuning
-#define HEADING_TOL_DEG       1.5f
-#define HEADING_KP            3.0f
-#define HEADING_MAX_CORR      40
+// Live calibration state (modifiable via UART without reflashing)
+extern float cal_mm_per_cm;
+extern float cal_angle_scale_cw;
+extern float cal_angle_scale_ccw;
+extern float cal_imu_blend;
+extern int   imu_enabled;
 
-// Callback invoked each oi_update tick during IMU/odometry moves
-typedef void (*move_step_cb_t)(float delta_cm, float imu_heading_deg);
+// Odometry callback called each oi_update() tick during tracked moves/turns
+// delta_cm: forward (+), backward (-)
+// delta_cw_deg: clockwise (+), counterclockwise (-)
+typedef void (*odom_step_cb_t)(float delta_cm, float delta_cw_deg);
 
 extern volatile int flag;
 
-// Basic movement functions (return actual cm traveled)
-double move_forward(oi_t *sensor, double centimeters, int speed);
-double move_backward(oi_t *sensor, double centimeters, int speed);
-void turn_clockwise(oi_t *sensor, int degrees);
-void turn_anticlockwise(oi_t *sensor, int degrees);
-void turn_to_angle(oi_t *sensor, int degrees);
-void go_around(oi_t *sensor, int direction);
-
-// Moves forward until target distance or bumper/wall/hole/destination trigger
-double move_forward_until_stop(oi_t *sensor, double centimeters, int speed);
-
-// IMU-assisted closed-loop turn & straight drive with continuous odometry callback
+// Angle utilities
 float normalize_deg(float deg);
 float angle_diff_deg(float target_deg, float current_deg);
-void turn_to_heading(oi_t *sensor, float target_deg);
-double move_forward_imu(oi_t *sensor, double centimeters, int speed,
-                        float target_imu_deg, move_step_cb_t on_step);
-double move_backward_odometry(oi_t *sensor, double centimeters, int speed,
-                              move_step_cb_t on_step);
+int   imu_read_heading_safe(float *out_deg);
+
+// Basic movement functions (return actual calibrated cm traveled)
+double move_forward(oi_t *sensor, double centimeters, int speed);
+double move_backward(oi_t *sensor, double centimeters, int speed);
+void   turn_clockwise(oi_t *sensor, int degrees);
+void   turn_anticlockwise(oi_t *sensor, int degrees);
+void   turn_to_angle(oi_t *sensor, int degrees);
+void   go_around(oi_t *sensor, int direction);
+
+// Moves forward until target distance or bump/wall/hole/destination trigger
+double move_forward_until_stop(oi_t *sensor, double centimeters, int speed);
+
+// Encoder-primary turns & drives with continuous odometry + IMU redundancy
+// turn_by_degrees: delta_cw_deg > 0 turns CW (right), < 0 turns CCW (left).
+// Returns estimated actual CW degrees turned (encoder primary + IMU redundancy).
+float  turn_by_degrees(oi_t *sensor, float delta_cw_deg,
+                       float *out_enc_deg, float *out_imu_deg);
+
+double move_forward_tracked(oi_t *sensor, double centimeters, int speed,
+                            odom_step_cb_t on_step, float *out_imu_drift_deg);
+
+double move_backward_tracked(oi_t *sensor, double centimeters, int speed,
+                             odom_step_cb_t on_step);
 
 #endif /* MOVEMENT_H_ */

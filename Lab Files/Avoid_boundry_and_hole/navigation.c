@@ -1,8 +1,8 @@
 /*
  * navigation.c
  *
- * Grid-based BFS path planner + IMU/encoder odometry + obstacle/hole avoidance
- * for the Autonomous Warehouse Bot (CPRE 288).
+ * Encoder-primary + dual-sensor (IR+PING) grid BFS path planner with
+ * active corridor collision checking and true sidestep obstacle detouring.
  */
 
 #include <stdio.h>
@@ -13,7 +13,6 @@
 #include "uart.h"
 #include "servo.h"
 #include "ping.h"
-#include "BNO055.h"
 #include "movement.h"
 #include "navigation.h"
 
@@ -24,11 +23,15 @@
 #define DEG_TO_RAD(d) ((d) * ((float)M_PI / 180.0f))
 #define RAD_TO_DEG(r) ((r) * (180.0f / (float)M_PI))
 
-#define DRIVE_SPEED          150
-#define CREEP_SPEED          80
-#define MAX_BURST_CM         50.0f
+#define DRIVE_SPEED          140
+#define CREEP_SPEED          75
+#define MAX_BURST_CM         45.0f
 #define GOAL_TOL_CM          10.0f
-#define MAX_SCAN_MARK_CM     115.0f
+#define MAX_SCAN_MARK_CM     105.0f
+#define CORRIDOR_HALF_W_CM   (ROBOT_RADIUS_CM + 7.0f)  // 24 cm half-width
+#define FRONT_STOP_MARGIN_CM 16.0f
+#define DETOUR_SIDE_CM       38.0f
+#define DETOUR_PASS_CM       36.0f
 #define MAX_PATH_LEN         160
 
 typedef struct {
@@ -46,33 +49,22 @@ static const RackBox RACKS[4] = {
     { 343.0f, 231.0f, RACK_WIDTH_X_CM * 0.5f, RACK_HEIGHT_Y_CM * 0.5f }  // RACK_TR
 };
 
-// Navigation state (static globals to keep TM4C stack usage tiny)
+// Static globals keep TM4C stack usage minimal
 static uint8_t grid[GRID_ROWS][GRID_COLS];
 static int16_t bfs_queue[GRID_ROWS * GRID_COLS];
 static int16_t bfs_parent[GRID_ROWS * GRID_COLS];
 static int16_t raw_path[MAX_PATH_LEN];
 static int16_t smooth_path[MAX_PATH_LEN];
 
-static BotPose bot_pose = { 25.0f, 25.0f, 0.0f };
-static float north_imu_deg = 0.0f;
+static BotPose bot_pose = { START_X_CM, START_Y_CM, START_BEARING_DEG };
 
 static int   dest_found = 0;
 static float dest_x_cm  = 0.0f;
 static float dest_y_cm  = 0.0f;
 
 // =========================================================================
-// Coordinate & Grid Helpers
+// Grid & Geometry Helpers
 // =========================================================================
-
-float nav_bearing_to_imu(float arena_bearing_deg)
-{
-    return normalize_deg(north_imu_deg + arena_bearing_deg);
-}
-
-float nav_imu_to_bearing(float imu_deg)
-{
-    return normalize_deg(imu_deg - north_imu_deg);
-}
 
 static int cm_to_col(float x)
 {
@@ -134,8 +126,13 @@ static void mark_circle(float cx, float cy, float radius_cm, uint8_t cell_type)
     {
         for (c = c_min; c <= c_max; c++)
         {
-            // Never overwrite permanent walls or racks
+            // Never overwrite permanent walls or racks; don't downgrade holes/bumps
             if (grid[r][c] == CELL_WALL || grid[r][c] == CELL_RACK)
+            {
+                continue;
+            }
+            if ((grid[r][c] == CELL_HOLE || grid[r][c] == CELL_BUMP) &&
+                cell_type == CELL_OBSTACLE)
             {
                 continue;
             }
@@ -149,14 +146,15 @@ static void mark_circle(float cx, float cy, float radius_cm, uint8_t cell_type)
     }
 }
 
-static void clear_temp_obstacles(void)
+static void clear_temp_obstacles(int include_bumps)
 {
     int r, c;
     for (r = 0; r < GRID_ROWS; r++)
     {
         for (c = 0; c < GRID_COLS; c++)
         {
-            if (grid[r][c] == CELL_OBSTACLE)
+            if (grid[r][c] == CELL_OBSTACLE ||
+                (include_bumps && grid[r][c] == CELL_BUMP))
             {
                 grid[r][c] = CELL_FREE;
             }
@@ -165,26 +163,25 @@ static void clear_temp_obstacles(void)
 }
 
 // =========================================================================
-// Odometry Callback (called every ~25 ms during moves)
+// Encoder-Primary Odometry Callback + Tracked Turn Wrapper
 // =========================================================================
 
-static void odometry_step_cb(float delta_cm, float imu_heading_deg)
+static void odometry_step_cb(float delta_cm, float delta_cw_deg)
 {
-    float bearing = nav_imu_to_bearing(imu_heading_deg);
-    float rad = DEG_TO_RAD(bearing);
+    // Midpoint bearing integration for smooth curved motion tracking
+    float mid_bearing = normalize_deg(bot_pose.bearing_deg + 0.5f * delta_cw_deg);
+    float rad = DEG_TO_RAD(mid_bearing);
 
     // Bearing 0 = +Y (North), 90 = +X (East)
     bot_pose.x += delta_cm * sinf(rad);
     bot_pose.y += delta_cm * cosf(rad);
-    bot_pose.bearing_deg = bearing;
+    bot_pose.bearing_deg = normalize_deg(bot_pose.bearing_deg + delta_cw_deg);
 
-    // Clamp softly inside arena bounds
     if (bot_pose.x < 0.0f) bot_pose.x = 0.0f;
     if (bot_pose.x > ARENA_WIDTH_CM) bot_pose.x = ARENA_WIDTH_CM;
     if (bot_pose.y < 0.0f) bot_pose.y = 0.0f;
     if (bot_pose.y > ARENA_HEIGHT_CM) bot_pose.y = ARENA_HEIGHT_CM;
 
-    // Mark traversed cell as visited
     int r = cm_to_row(bot_pose.y);
     int c = cm_to_col(bot_pose.x);
     if (grid[r][c] == CELL_FREE)
@@ -193,19 +190,35 @@ static void odometry_step_cb(float delta_cm, float imu_heading_deg)
     }
 }
 
+static void nav_turn_to_bearing(oi_t *sensor, float target_bearing_deg)
+{
+    target_bearing_deg = normalize_deg(target_bearing_deg);
+    float delta_cw = angle_diff_deg(target_bearing_deg, bot_pose.bearing_deg);
+
+    if (fabsf(delta_cw) < 2.0f)
+    {
+        return;
+    }
+
+    float actual_cw = turn_by_degrees(sensor, delta_cw, 0, 0);
+    bot_pose.bearing_deg = normalize_deg(bot_pose.bearing_deg + actual_cw);
+}
+
 // =========================================================================
 // Public Init / Pose / Telemetry
 // =========================================================================
 
-void nav_init(float south_imu_deg)
+void nav_init_sw_corner(void)
 {
     int r, c;
 
-    // South is 180 deg clockwise from North
-    north_imu_deg = normalize_deg(south_imu_deg + 180.0f);
     dest_found = 0;
     dest_x_cm = 0.0f;
     dest_y_cm = 0.0f;
+
+    bot_pose.x = START_X_CM;
+    bot_pose.y = START_Y_CM;
+    bot_pose.bearing_deg = START_BEARING_DEG;
 
     for (r = 0; r < GRID_ROWS; r++)
     {
@@ -214,7 +227,6 @@ void nav_init(float south_imu_deg)
         {
             float x = col_to_cm(c);
 
-            // Outer arena boundary walls (inflated by robot radius + 2 cm)
             if (x < (ROBOT_RADIUS_CM + 2.0f) ||
                 x > (ARENA_WIDTH_CM - ROBOT_RADIUS_CM - 2.0f) ||
                 y < (ROBOT_RADIUS_CM + 2.0f) ||
@@ -234,20 +246,15 @@ void nav_init(float south_imu_deg)
     }
 }
 
-void nav_set_pose(float x_cm, float y_cm)
+void nav_set_pose(float x_cm, float y_cm, float bearing_deg)
 {
-    float heading = 0.0f;
-    bno055_convert_float_euler_h_deg(&heading);
     bot_pose.x = x_cm;
     bot_pose.y = y_cm;
-    bot_pose.bearing_deg = nav_imu_to_bearing(heading);
+    bot_pose.bearing_deg = normalize_deg(bearing_deg);
 }
 
 BotPose nav_get_pose(void)
 {
-    float heading = 0.0f;
-    bno055_convert_float_euler_h_deg(&heading);
-    bot_pose.bearing_deg = nav_imu_to_bearing(heading);
     return bot_pose;
 }
 
@@ -265,13 +272,12 @@ void nav_get_dest(float *out_x, float *out_y)
 void nav_send_telemetry(void)
 {
     char buf[80];
-    BotPose p = nav_get_pose();
-    sprintf(buf, "POS %.1f %.1f %.1f\r\n", p.x, p.y, p.bearing_deg);
+    sprintf(buf, "POS %.1f %.1f %.1f\r\n", bot_pose.x, bot_pose.y, bot_pose.bearing_deg);
     uart_sendStr(buf);
 }
 
 // =========================================================================
-// Rack Side Targets
+// Rack Side Targets (Left = SIDE_WEST, Right = SIDE_EAST)
 // =========================================================================
 
 int nav_get_rack_target(RackId rack, RackSide side,
@@ -280,7 +286,7 @@ int nav_get_rack_target(RackId rack, RackSide side,
 {
     if (rack < RACK_BL || rack > RACK_TR) return 0;
 
-    // South side of bottom racks and North side of top racks touch the wall
+    // South side of bottom racks and North side of top racks sit on the arena wall
     if ((rack == RACK_BL || rack == RACK_BR) && side == SIDE_SOUTH) return 0;
     if ((rack == RACK_TL || rack == RACK_TR) && side == SIDE_NORTH) return 0;
 
@@ -291,12 +297,12 @@ int nav_get_rack_target(RackId rack, RackSide side,
 
     switch (side)
     {
-        case SIDE_WEST:
+        case SIDE_WEST: // Left side of rack
             tx = rb->cx - rb->half_x - RACK_STANDOFF_CM;
             ty = rb->cy;
             bearing = 90.0f;  // Face East toward rack
             break;
-        case SIDE_EAST:
+        case SIDE_EAST: // Right side of rack
             tx = rb->cx + rb->half_x + RACK_STANDOFF_CM;
             ty = rb->cy;
             bearing = 270.0f; // Face West toward rack
@@ -322,33 +328,70 @@ int nav_get_rack_target(RackId rack, RackSide side,
 }
 
 // =========================================================================
-// Sensor-to-Map Projection
+// Scan-to-Map Projection & Direct Forward Corridor Clearance Check
 // =========================================================================
+
+// Inspects the raw fused scan array (IR + PING) for ANY obstacle lying inside
+// the robot's forward driving corridor (half-width = ROBOT_RADIUS + 7 cm).
+// Returns maximum safe forward travel distance in cm (0 if blocked right ahead).
+float nav_check_front_corridor_cm(float max_check_cm, int *out_hit_angle)
+{
+    float safe_cm = max_check_cm;
+    int hit_angle = -1;
+    int idx;
+
+    // Servo 0 = right, 90 = straight ahead, 180 = left
+    for (idx = 10; idx <= 80; idx++) // 20 deg .. 160 deg
+    {
+        float d = scan_fused_cm[idx];
+        if (d <= 4.0f || d > (max_check_cm + FRONT_STOP_MARGIN_CM))
+        {
+            continue;
+        }
+
+        float deg = (float)(idx * 2);
+        float rad = DEG_TO_RAD(deg);
+        float fwd = d * sinf(rad);        // Ahead of sensor
+        float lat = fabsf(d * cosf(rad)); // Sideways distance from centerline
+
+        if (lat < CORRIDOR_HALF_W_CM)
+        {
+            float allowable = fwd - FRONT_STOP_MARGIN_CM;
+            if (allowable < 0.0f) allowable = 0.0f;
+            if (allowable < safe_cm)
+            {
+                safe_cm = allowable;
+                hit_angle = idx * 2;
+            }
+        }
+    }
+
+    if (out_hit_angle) *out_hit_angle = hit_angle;
+    return safe_cm;
+}
 
 static void mark_scanned_objects(float protect_goal_x, float protect_goal_y)
 {
-    BotPose p = nav_get_pose();
     char buf[80];
     int i;
 
     for (i = 0; i < object_count; i++)
     {
         float dist = detected_objects[i].distance;
-        if (dist <= 5.0f || dist > MAX_SCAN_MARK_CM)
+        if (dist <= 4.0f || dist > MAX_SCAN_MARK_CM)
         {
             continue;
         }
 
-        // Servo 0 = right (+90 CW), 90 = front (0), 180 = left (-90 CCW)
-        float ray_bearing = normalize_deg(p.bearing_deg + (90.0f - (float)detected_objects[i].center_angle));
+        float ray_bearing = normalize_deg(bot_pose.bearing_deg +
+                                          (90.0f - (float)detected_objects[i].center_angle));
         float rad = DEG_TO_RAD(ray_bearing);
 
-        // Sensor sits near front edge (~10 cm ahead of robot center)
+        // Sensor sits ~10 cm ahead of robot center
         float total_r = dist + 10.0f;
-        float ox = p.x + total_r * sinf(rad);
-        float oy = p.y + total_r * cosf(rad);
+        float ox = bot_pose.x + total_r * sinf(rad);
+        float oy = bot_pose.y + total_r * cosf(rad);
 
-        // Skip readings outside the arena or already belonging to a known rack
         if (ox < 8.0f || ox > (ARENA_WIDTH_CM - 8.0f) ||
             oy < 8.0f || oy > (ARENA_HEIGHT_CM - 8.0f))
         {
@@ -359,74 +402,222 @@ static void mark_scanned_objects(float protect_goal_x, float protect_goal_y)
             continue;
         }
 
-        // Don't accidentally block our immediate standoff goal cell
+        // Do not accidentally block our immediate standoff goal cell
         float gdx = ox - protect_goal_x;
         float gdy = oy - protect_goal_y;
-        if ((gdx * gdx + gdy * gdy) < (18.0f * 18.0f))
+        if ((gdx * gdx + gdy * gdy) < (16.0f * 16.0f))
         {
             continue;
         }
 
-        float obj_rad = (detected_objects[i].linear_width * 0.5f) + ROBOT_RADIUS_CM;
-        if (obj_rad < 18.0f) obj_rad = 18.0f;
-        if (obj_rad > 32.0f) obj_rad = 32.0f;
+        // Generous inflation so BFS routes cleanly around pillars & boxes
+        float obj_rad = (detected_objects[i].linear_width * 0.5f) + ROBOT_RADIUS_CM + 6.0f;
+        if (obj_rad < 23.0f) obj_rad = 23.0f;
+        if (obj_rad > 36.0f) obj_rad = 36.0f;
 
         mark_circle(ox, oy, obj_rad, CELL_OBSTACLE);
 
-        sprintf(buf, "OBS %.1f %.1f %.1f\r\n", ox, oy, detected_objects[i].linear_width);
+        sprintf(buf, "OBS %.1f %.1f d:%.1f w:%.1f\r\n",
+                ox, oy, dist, detected_objects[i].linear_width);
         uart_sendStr(buf);
+    }
+}
+
+static void mark_corridor_blocker(int hit_angle, float dist_cm)
+{
+    float ray_bearing = normalize_deg(bot_pose.bearing_deg + (90.0f - (float)hit_angle));
+    float rad = DEG_TO_RAD(ray_bearing);
+    float ox = bot_pose.x + (dist_cm + 10.0f) * sinf(rad);
+    float oy = bot_pose.y + (dist_cm + 10.0f) * cosf(rad);
+
+    if (!point_inside_any_rack(ox, oy, 8.0f))
+    {
+        mark_circle(ox, oy, 26.0f, CELL_OBSTACLE);
     }
 }
 
 static void mark_hazard_from_flag(int move_flag)
 {
-    BotPose p = nav_get_pose();
     float offset_deg = 0.0f;
-    uint8_t cell_type = CELL_OBSTACLE;
-    float mark_r = 20.0f;
+    uint8_t cell_type = CELL_BUMP;
+    float mark_r = 28.0f; // Large enough (~2 cells) so BFS truly routes around
 
     switch (move_flag)
     {
-        case MOVE_FLAG_BUMP_LEFT:
-            offset_deg = -30.0f;
-            cell_type = CELL_OBSTACLE;
-            break;
-        case MOVE_FLAG_BUMP_RIGHT:
-            offset_deg = 30.0f;
-            cell_type = CELL_OBSTACLE;
-            break;
-        case MOVE_FLAG_BUMP_BOTH:
-            offset_deg = 0.0f;
-            cell_type = CELL_OBSTACLE;
-            break;
-        case MOVE_FLAG_HOLE_LEFT:
-            offset_deg = -40.0f;
-            cell_type = CELL_HOLE;
-            mark_r = 24.0f;
-            break;
-        case MOVE_FLAG_HOLE_RIGHT:
-            offset_deg = 40.0f;
-            cell_type = CELL_HOLE;
-            mark_r = 24.0f;
-            break;
-        case MOVE_FLAG_HOLE_FRONT:
-            offset_deg = 0.0f;
-            cell_type = CELL_HOLE;
-            mark_r = 24.0f;
-            break;
-        default:
-            return; // Walls are already permanent on the map
+        case MOVE_FLAG_BUMP_LEFT:   offset_deg = -25.0f; cell_type = CELL_BUMP; break;
+        case MOVE_FLAG_BUMP_RIGHT:  offset_deg =  25.0f; cell_type = CELL_BUMP; break;
+        case MOVE_FLAG_BUMP_BOTH:   offset_deg =   0.0f; cell_type = CELL_BUMP; break;
+        case MOVE_FLAG_HOLE_LEFT:   offset_deg = -35.0f; cell_type = CELL_HOLE; mark_r = 30.0f; break;
+        case MOVE_FLAG_HOLE_RIGHT:  offset_deg =  35.0f; cell_type = CELL_HOLE; mark_r = 30.0f; break;
+        case MOVE_FLAG_HOLE_FRONT:  offset_deg =   0.0f; cell_type = CELL_HOLE; mark_r = 30.0f; break;
+        default: return;
     }
 
-    float rad = DEG_TO_RAD(normalize_deg(p.bearing_deg + offset_deg));
-    float hx = p.x + (ROBOT_RADIUS_CM + 6.0f) * sinf(rad);
-    float hy = p.y + (ROBOT_RADIUS_CM + 6.0f) * cosf(rad);
+    float rad = DEG_TO_RAD(normalize_deg(bot_pose.bearing_deg + offset_deg));
+    float hx = bot_pose.x + (ROBOT_RADIUS_CM + 8.0f) * sinf(rad);
+    float hy = bot_pose.y + (ROBOT_RADIUS_CM + 8.0f) * cosf(rad);
 
     mark_circle(hx, hy, mark_r, cell_type);
 
     char buf[64];
     sprintf(buf, "HAZ %d %.1f %.1f\r\n", move_flag, hx, hy);
     uart_sendStr(buf);
+}
+
+// =========================================================================
+// Active Detour Maneuver (Actually Goes Around Obstacles / Short Boxes / Holes!)
+// =========================================================================
+
+static float quick_ping_sector_min(int deg_start, int deg_end)
+{
+    float min_cm = 200.0f;
+    int deg;
+    for (deg = deg_start; deg <= deg_end; deg += 10)
+    {
+        servo_move((float)deg);
+        timer_waitMillis(65);
+        float d = ping_read_cm();
+        if (d > 4.0f && d < min_cm)
+        {
+            min_cm = d;
+        }
+    }
+    servo_move(90.0f);
+    return min_cm;
+}
+
+// Actively sidesteps around a bumper hit, floor hole, or close scanned obstacle.
+// Returns 1 if sidestep completed cleanly, 2 if destination mat hit during detour.
+static int nav_detour_around_hazard(oi_t *sensor, int move_flag,
+                                    float goal_x, float goal_y)
+{
+    float orig_bearing = bot_pose.bearing_deg;
+
+    // 1. Back up if physically against a bump, hole, or wall
+    if (move_flag != MOVE_FLAG_NONE)
+    {
+        move_backward_tracked(sensor, 15.0, DRIVE_SPEED, odometry_step_cb);
+    }
+
+    // 2. Measure right (15..35 deg) vs left (145..165 deg) clearance with PING
+    float right_clear = quick_ping_sector_min(15, 35);
+    float left_clear  = quick_ping_sector_min(145, 165);
+
+    // Check map safety 38 cm to Right (+90 CW) vs Left (-90 CCW)
+    float right_rad = DEG_TO_RAD(normalize_deg(orig_bearing + 90.0f));
+    float left_rad  = DEG_TO_RAD(normalize_deg(orig_bearing - 90.0f));
+
+    float rx = bot_pose.x + DETOUR_SIDE_CM * sinf(right_rad);
+    float ry = bot_pose.y + DETOUR_SIDE_CM * cosf(right_rad);
+    float lx = bot_pose.x + DETOUR_SIDE_CM * sinf(left_rad);
+    float ly = bot_pose.y + DETOUR_SIDE_CM * cosf(left_rad);
+
+    int right_map_ok = cell_is_walkable(cm_to_row(ry), cm_to_col(rx));
+    int left_map_ok  = cell_is_walkable(cm_to_row(ly), cm_to_col(lx));
+
+    // Score each side
+    float right_score = right_clear + (right_map_ok ? 80.0f : -120.0f);
+    float left_score  = left_clear  + (left_map_ok  ? 80.0f : -120.0f);
+
+    // Prefer dodging away from the side that was hit
+    if (move_flag == MOVE_FLAG_BUMP_LEFT  || move_flag == MOVE_FLAG_HOLE_LEFT  || move_flag == MOVE_FLAG_WALL_LEFT)
+        right_score += 35.0f;
+    if (move_flag == MOVE_FLAG_BUMP_RIGHT || move_flag == MOVE_FLAG_HOLE_RIGHT || move_flag == MOVE_FLAG_WALL_RIGHT)
+        left_score += 35.0f;
+
+    // Slight tie-breaker toward the goal
+    float dist_r = sqrtf((goal_x - rx) * (goal_x - rx) + (goal_y - ry) * (goal_y - ry));
+    float dist_l = sqrtf((goal_x - lx) * (goal_x - lx) + (goal_y - ly) * (goal_y - ly));
+    if (dist_r < dist_l) right_score += 15.0f;
+    else                 left_score  += 15.0f;
+
+    int try_order[2];
+    if (right_score >= left_score)
+    {
+        try_order[0] = 1;  // Right (+90 CW) first
+        try_order[1] = -1; // Left (-90 CCW) fallback
+    }
+    else
+    {
+        try_order[0] = -1;
+        try_order[1] = 1;
+    }
+
+    int attempt;
+    for (attempt = 0; attempt < 2; attempt++)
+    {
+        int dir = try_order[attempt];
+        float side_bearing = normalize_deg(orig_bearing + (float)(dir * 90));
+
+        char buf[64];
+        sprintf(buf, "DETOUR %s (R:%.0f L:%.0f)\r\n",
+                (dir > 0) ? "RIGHT" : "LEFT", right_clear, left_clear);
+        uart_sendStr(buf);
+
+        // Turn 90 deg to open side
+        nav_turn_to_bearing(sensor, side_bearing);
+
+        // Check front clearance before sidestepping
+        float side_fwd = quick_ping_sector_min(70, 110);
+        if (side_fwd < 25.0f)
+        {
+            continue; // Blocked on this side, try the other side!
+        }
+
+        double step_dist = (side_fwd - 14.0f < DETOUR_SIDE_CM)
+                           ? (double)(side_fwd - 14.0f) : (double)DETOUR_SIDE_CM;
+        double moved = move_forward_tracked(sensor, step_dist, DRIVE_SPEED, odometry_step_cb, 0);
+
+        if (flag == MOVE_FLAG_DESTINATION)
+        {
+            dest_found = 1;
+            dest_x_cm = bot_pose.x;
+            dest_y_cm = bot_pose.y;
+            return 2;
+        }
+        if (flag != MOVE_FLAG_NONE)
+        {
+            mark_hazard_from_flag(flag);
+            move_backward_tracked(sensor, 12.0, DRIVE_SPEED, odometry_step_cb);
+            if (moved < 20.0)
+            {
+                continue; // Couldn't clear this side; try opposite side
+            }
+        }
+
+        // Turn back parallel to original heading and pass the obstacle (only if map-safe!)
+        nav_turn_to_bearing(sensor, orig_bearing);
+        float orig_rad = DEG_TO_RAD(orig_bearing);
+        float px = bot_pose.x + DETOUR_PASS_CM * sinf(orig_rad);
+        float py = bot_pose.y + DETOUR_PASS_CM * cosf(orig_rad);
+        float pass_clear = quick_ping_sector_min(65, 115);
+
+        if (pass_clear > 24.0f &&
+            cell_is_walkable(cm_to_row(py), cm_to_col(px)) &&
+            !point_inside_any_rack(px, py, ROBOT_RADIUS_CM))
+        {
+            double pass_dist = (pass_clear - 15.0f < DETOUR_PASS_CM)
+                               ? (double)(pass_clear - 15.0f) : (double)DETOUR_PASS_CM;
+            move_forward_tracked(sensor, pass_dist, DRIVE_SPEED, odometry_step_cb, 0);
+
+            if (flag == MOVE_FLAG_DESTINATION)
+            {
+                dest_found = 1;
+                dest_x_cm = bot_pose.x;
+                dest_y_cm = bot_pose.y;
+                return 2;
+            }
+            if (flag != MOVE_FLAG_NONE)
+            {
+                mark_hazard_from_flag(flag);
+                move_backward_tracked(sensor, 12.0, DRIVE_SPEED, odometry_step_cb);
+            }
+        }
+
+        return 1; // Successfully sidestepped around obstacle!
+    }
+
+    return 0;
 }
 
 // =========================================================================
@@ -484,9 +675,6 @@ static int line_of_sight_clear(int r0, int c0, int r1, int c1)
     return 1;
 }
 
-// Plans a path from current bot cell to (goal_x, goal_y).
-// Populates smooth_path[] with compressed cell indices (start..goal).
-// Returns number of waypoints in smooth_path[], or 0 if unreachable.
 static int plan_bfs_path(float goal_x, float goal_y)
 {
     const int total_cells = GRID_ROWS * GRID_COLS;
@@ -498,6 +686,11 @@ static int plan_bfs_path(float goal_x, float goal_y)
     int gr = cm_to_row(goal_y);
     int gc = cm_to_col(goal_x);
 
+    // If odometry drifted slightly into an inflated margin cell, escape to nearest free cell
+    if (!find_nearest_walkable(sr, sc, &sr, &sc))
+    {
+        return 0;
+    }
     if (!find_nearest_walkable(gr, gc, &gr, &gc))
     {
         return 0;
@@ -561,7 +754,6 @@ static int plan_bfs_path(float goal_x, float goal_y)
         return 0;
     }
 
-    // Reconstruct backwards from goal to start
     int raw_len = 0;
     int cur = goal_idx;
     while (cur != start_idx && raw_len < MAX_PATH_LEN - 1)
@@ -571,7 +763,6 @@ static int plan_bfs_path(float goal_x, float goal_y)
     }
     raw_path[raw_len++] = (int16_t)start_idx;
 
-    // Reverse into start -> goal order
     for (i = 0; i < raw_len / 2; i++)
     {
         int16_t tmp = raw_path[i];
@@ -579,7 +770,6 @@ static int plan_bfs_path(float goal_x, float goal_y)
         raw_path[raw_len - 1 - i] = tmp;
     }
 
-    // Greedy line-of-sight smoothing to produce clean straight segments
     int smooth_len = 0;
     int anchor = 0;
     smooth_path[smooth_len++] = raw_path[0];
@@ -609,7 +799,7 @@ static int plan_bfs_path(float goal_x, float goal_y)
 }
 
 // =========================================================================
-// Core Drive-To-Coordinate Loop (Milestone 1!)
+// Core Drive-To-Coordinate Loop
 // =========================================================================
 
 // Returns: 1 = reached goal, 2 = stopped on destination mat, 0 = failed
@@ -617,13 +807,13 @@ int nav_drive_to_coord(oi_t *sensor, float goal_x, float goal_y,
                        int do_scans, int stop_on_dest)
 {
     int iter = 0;
-    int cleared_once = 0;
+    int clear_stage = 0;
     char buf[80];
 
     sprintf(buf, "GOAL %.1f %.1f\r\n", goal_x, goal_y);
     uart_sendStr(buf);
 
-    while (iter < 80)
+    while (iter < 90)
     {
         iter++;
         float dx_goal = goal_x - bot_pose.x;
@@ -631,8 +821,9 @@ int nav_drive_to_coord(oi_t *sensor, float goal_x, float goal_y,
         float dist_goal = sqrtf(dx_goal * dx_goal + dy_goal * dy_goal);
 
         nav_send_telemetry();
-        lcd_printf("Pos:%.0f,%.0f\nGoal:%.0f,%.0f\nDist:%.0fcm",
-                   bot_pose.x, bot_pose.y, goal_x, goal_y, dist_goal);
+        lcd_printf("Pos:%.0f,%.0f %.0f\nGoal:%.0f,%.0f\nDist:%.0fcm",
+                   bot_pose.x, bot_pose.y, bot_pose.bearing_deg,
+                   goal_x, goal_y, dist_goal);
 
         if (dist_goal <= GOAL_TOL_CM)
         {
@@ -640,34 +831,38 @@ int nav_drive_to_coord(oi_t *sensor, float goal_x, float goal_y,
             return 1;
         }
 
-        // Plan path through occupancy grid
+        // 1. Plan BFS path around racks, holes, bumps, and scanned pillars
         int path_len = plan_bfs_path(goal_x, goal_y);
         if (path_len == 0)
         {
-            if (!cleared_once)
+            if (clear_stage == 0)
             {
-                // Clear transient scan obstacles (keep racks/walls/holes) and retry
-                uart_sendStr("REPLAN_CLEAR\r\n");
-                clear_temp_obstacles();
-                cleared_once = 1;
+                uart_sendStr("REPLAN_CLEAR_SCAN\r\n");
+                clear_temp_obstacles(0); // Keep bumps & holes
+                clear_stage = 1;
+                continue;
+            }
+            else if (clear_stage == 1)
+            {
+                uart_sendStr("REPLAN_CLEAR_BUMPS\r\n");
+                clear_temp_obstacles(1); // Keep racks, walls, holes
+                clear_stage = 2;
                 continue;
             }
             uart_sendStr("NO_PATH\r\n");
             return 0;
         }
 
-        // Pick next waypoint (index 1, or exact goal if at final segment)
+        // Pick next waypoint
         float wp_x = goal_x;
         float wp_y = goal_y;
         if (path_len >= 2)
         {
             int wp_idx = smooth_path[1];
-            int wp_r = wp_idx / GRID_COLS;
-            int wp_c = wp_idx % GRID_COLS;
             if (path_len > 2)
             {
-                wp_x = col_to_cm(wp_c);
-                wp_y = row_to_cm(wp_r);
+                wp_x = col_to_cm(wp_idx % GRID_COLS);
+                wp_y = row_to_cm(wp_idx / GRID_COLS);
             }
         }
 
@@ -679,38 +874,50 @@ int nav_drive_to_coord(oi_t *sensor, float goal_x, float goal_y,
             continue;
         }
 
-        // Turn toward waypoint using BNO055 IMU
+        // 2. Turn toward waypoint (encoder-primary + IMU redundancy)
         float target_bearing = normalize_deg(RAD_TO_DEG(atan2f(dx, dy)));
-        float target_imu = nav_bearing_to_imu(target_bearing);
-        turn_to_heading(sensor, target_imu);
+        nav_turn_to_bearing(sensor, target_bearing);
 
-        // Scan forward hemisphere before driving a burst
+        float burst = (seg_dist > MAX_BURST_CM) ? MAX_BURST_CM : seg_dist;
+
+        // 3. Scan forward hemisphere AND verify the direct driving corridor!
         if (do_scans)
         {
-            scan_field();
+            scan_field(0);
             mark_scanned_objects(goal_x, goal_y);
 
-            // Re-check if scan just revealed an obstacle directly on our segment
-            int new_len = plan_bfs_path(goal_x, goal_y);
-            if (new_len >= 2 && new_len != path_len)
+            int hit_angle = -1;
+            float safe_cm = nav_check_front_corridor_cm(burst, &hit_angle);
+
+            if (hit_angle >= 0 && safe_cm < burst)
             {
-                int new_idx = smooth_path[1];
-                float ndx = col_to_cm(new_idx % GRID_COLS) - bot_pose.x;
-                float ndy = row_to_cm(new_idx / GRID_COLS) - bot_pose.y;
-                float new_bearing = normalize_deg(RAD_TO_DEG(atan2f(ndx, ndy)));
-                if (fabsf(angle_diff_deg(new_bearing, target_bearing)) > 20.0f)
+                float blocker_d = scan_fused_cm[hit_angle / 2];
+                sprintf(buf, "CORRIDOR_BLOCK ang:%d d:%.1f safe:%.1f\r\n",
+                        hit_angle, blocker_d, safe_cm);
+                uart_sendStr(buf);
+
+                // Mark the blocking object in the grid
+                mark_corridor_blocker(hit_angle, blocker_d);
+
+                if (safe_cm < 18.0f)
                 {
-                    // Obstacle directly ahead -> replan immediately before moving
+                    // Too close to drive straight -> actively sidestep around it!
+                    int d_res = nav_detour_around_hazard(sensor, MOVE_FLAG_NONE, goal_x, goal_y);
+                    if (d_res == 2 && stop_on_dest) return 2;
                     continue;
+                }
+                else
+                {
+                    // Shorten burst so we stop safely short of the obstacle, then re-plan
+                    burst = safe_cm;
                 }
             }
         }
 
-        // Drive capped burst length so we re-scan and stay accurate
-        float burst = (seg_dist > MAX_BURST_CM) ? MAX_BURST_CM : seg_dist;
-        move_forward_imu(sensor, burst, DRIVE_SPEED, target_imu, odometry_step_cb);
+        // 4. Drive burst straight using wheel encoders
+        move_forward_tracked(sensor, burst, DRIVE_SPEED, odometry_step_cb, 0);
 
-        // Handle stop condition
+        // 5. Handle stop triggers
         if (flag == MOVE_FLAG_DESTINATION)
         {
             dest_found = 1;
@@ -726,178 +933,23 @@ int nav_drive_to_coord(oi_t *sensor, float goal_x, float goal_y,
         }
         else if (flag != MOVE_FLAG_NONE)
         {
-            // Bump, hole, or unexpected wall: mark hazard, back up, and replan
+            // Bump, hole, or wall: mark persistently & genuinely go around it!
             mark_hazard_from_flag(flag);
-            move_backward_odometry(sensor, 12.0, DRIVE_SPEED, odometry_step_cb);
-            cleared_once = 0;
-        }
-    }
+            clear_stage = 0;
 
-    return 0;
-}
-
-// =========================================================================
-// Two-Wall Localization (works from any starting position & orientation!)
-// =========================================================================
-
-// Helper: measure average front clearance (70..110 deg) using PING
-static float measure_front_clearance_cm(void)
-{
-    float min_cm = 250.0f;
-    int deg;
-    for (deg = 70; deg <= 110; deg += 10)
-    {
-        servo_move((float)deg);
-        timer_waitMillis(60);
-        float d = ping_read_cm();
-        if (d > 0.0f && d < min_cm)
-        {
-            min_cm = d;
-        }
-    }
-    servo_move(90.0f);
-    return min_cm;
-}
-
-// Drives along a cardinal bearing until white wall tape is hit,
-// dodging bumps/holes sideways while tracking odometry.
-// Returns 1 if wall reached, 0 on failure.
-static int drive_to_wall(oi_t *sensor, float wall_bearing_deg, int track_odom)
-{
-    float wall_imu = nav_bearing_to_imu(wall_bearing_deg);
-    int attempts = 0;
-
-    while (attempts < 12)
-    {
-        attempts++;
-        turn_to_heading(sensor, wall_imu);
-
-        move_forward_imu(sensor, 400.0, DRIVE_SPEED, wall_imu,
-                         track_odom ? odometry_step_cb : 0);
-
-        if (flag == MOVE_FLAG_WALL_FRONT ||
-            flag == MOVE_FLAG_WALL_LEFT  ||
-            flag == MOVE_FLAG_WALL_RIGHT)
-        {
-            return 1;
-        }
-
-        if (flag == MOVE_FLAG_DESTINATION)
-        {
-            // Keep going; note we can't store world dest until localized
-            move_forward_imu(sensor, 20.0, DRIVE_SPEED, wall_imu,
-                             track_odom ? odometry_step_cb : 0);
-            continue;
-        }
-
-        if (flag != MOVE_FLAG_NONE)
-        {
-            // Obstacle or hole blocking path to wall -> back up and sidestep 35 cm
-            move_backward_odometry(sensor, 14.0, DRIVE_SPEED,
-                                   track_odom ? odometry_step_cb : 0);
-
-            float dodge_bearing = normalize_deg(wall_bearing_deg + 90.0f);
-            float dodge_imu = nav_bearing_to_imu(dodge_bearing);
-            turn_to_heading(sensor, dodge_imu);
-
-            if (measure_front_clearance_cm() < 40.0f)
+            int d_res = nav_detour_around_hazard(sensor, flag, goal_x, goal_y);
+            if (d_res == 2 && stop_on_dest)
             {
-                dodge_bearing = normalize_deg(wall_bearing_deg - 90.0f);
-                dodge_imu = nav_bearing_to_imu(dodge_bearing);
-                turn_to_heading(sensor, dodge_imu);
+                return 2;
             }
-
-            move_forward_imu(sensor, 35.0, DRIVE_SPEED, dodge_imu,
-                             track_odom ? odometry_step_cb : 0);
         }
     }
+
     return 0;
 }
 
-int nav_localize_two_walls(oi_t *sensor)
-{
-    uart_sendStr("LOCALIZING_START\r\n");
-    lcd_printf("Localizing...\nStep 1: X wall");
-
-    // Step 1: Compare West (270) vs East (90) clearance.
-    // Prefer West because West wall is always x = ROBOT_RADIUS_CM regardless of total width.
-    turn_to_heading(sensor, nav_bearing_to_imu(270.0f));
-    float west_clear = measure_front_clearance_cm();
-
-    float x_wall_bearing = 270.0f;
-    if (west_clear < 35.0f)
-    {
-        turn_to_heading(sensor, nav_bearing_to_imu(90.0f));
-        float east_clear = measure_front_clearance_cm();
-        if (east_clear > west_clear)
-        {
-            x_wall_bearing = 90.0f;
-        }
-    }
-
-    if (!drive_to_wall(sensor, x_wall_bearing, 0))
-    {
-        uart_sendStr("LOCALIZE_FAIL_X\r\n");
-        return 0;
-    }
-
-    // Lock X coordinate from the wall we just touched
-    if (x_wall_bearing == 270.0f)
-    {
-        bot_pose.x = ROBOT_RADIUS_CM;
-    }
-    else
-    {
-        bot_pose.x = ARENA_WIDTH_CM - ROBOT_RADIUS_CM;
-    }
-    bot_pose.y = ARENA_HEIGHT_CM * 0.5f; // Temporary until Step 2 locks Y
-
-    // Back off wall cleanly (now tracking X odometry!)
-    move_backward_odometry(sensor, 15.0, DRIVE_SPEED, odometry_step_cb);
-
-    // Step 2: Compare South (180) vs North (0) clearance and drive to Y wall
-    lcd_printf("Localizing...\nStep 2: Y wall");
-    turn_to_heading(sensor, nav_bearing_to_imu(180.0f));
-    float south_clear = measure_front_clearance_cm();
-
-    float y_wall_bearing = 180.0f;
-    if (south_clear < 35.0f)
-    {
-        turn_to_heading(sensor, nav_bearing_to_imu(0.0f));
-        float north_clear = measure_front_clearance_cm();
-        if (north_clear > south_clear)
-        {
-            y_wall_bearing = 0.0f;
-        }
-    }
-
-    if (!drive_to_wall(sensor, y_wall_bearing, 1))
-    {
-        uart_sendStr("LOCALIZE_FAIL_Y\r\n");
-        return 0;
-    }
-
-    // Lock Y coordinate from the wall we just touched
-    if (y_wall_bearing == 180.0f)
-    {
-        bot_pose.y = ROBOT_RADIUS_CM;
-    }
-    else
-    {
-        bot_pose.y = ARENA_HEIGHT_CM - ROBOT_RADIUS_CM;
-    }
-
-    move_backward_odometry(sensor, 15.0, DRIVE_SPEED, odometry_step_cb);
-
-    char buf[80];
-    sprintf(buf, "LOCALIZED %.1f %.1f\r\n", bot_pose.x, bot_pose.y);
-    uart_sendStr(buf);
-    lcd_printf("Localized!\nX:%.1f Y:%.1f", bot_pose.x, bot_pose.y);
-    return 1;
-}
-
 // =========================================================================
-// Rack Approach + Free Coordinate Re-Calibration
+// Rack Approach (Left/Right/North/South of any of the 4 racks)
 // =========================================================================
 
 int nav_approach_rack(oi_t *sensor, RackId rack, RackSide side)
@@ -909,15 +961,14 @@ int nav_approach_rack(oi_t *sensor, RackId rack, RackSide side)
         return 0;
     }
 
-    // 1. Navigate to standoff coordinate in front of the chosen rack side
+    // 1. Navigate from current position to the rack side's standoff point
     if (!nav_drive_to_coord(sensor, tx, ty, 1, 0))
     {
         return 0;
     }
 
     // 2. Turn to face the rack wall directly
-    float approach_imu = nav_bearing_to_imu(approach_bearing);
-    turn_to_heading(sensor, approach_imu);
+    nav_turn_to_bearing(sensor, approach_bearing);
 
     // 3. Measure PING straight ahead and creep to within ~6 cm of the rack
     servo_move(90.0f);
@@ -927,12 +978,12 @@ int nav_approach_rack(oi_t *sensor, RackId rack, RackSide side)
     if (d_cm > RACK_FINAL_GAP_CM && d_cm < 45.0f)
     {
         float creep = d_cm - RACK_FINAL_GAP_CM;
-        move_forward_imu(sensor, creep, CREEP_SPEED, approach_imu, odometry_step_cb);
+        move_forward_tracked(sensor, creep, CREEP_SPEED, odometry_step_cb, 0);
         timer_waitMillis(100);
         d_cm = ping_read_cm();
     }
 
-    // 4. Re-calibrate X or Y from known rack face + live PING distance!
+    // 4. Re-calibrate X or Y from known rack wall + PING distance
     if (d_cm > 0.0f && d_cm < 30.0f)
     {
         const RackBox *rb = &RACKS[rack];
@@ -948,10 +999,10 @@ int nav_approach_rack(oi_t *sensor, RackId rack, RackSide side)
             (int)rack, (int)side, bot_pose.x, bot_pose.y);
     uart_sendStr(buf);
     lcd_printf("Picked up!\nRack %d Side %d", (int)rack, (int)side);
-    timer_waitMillis(1000);
+    timer_waitMillis(800);
 
     // 5. Back off safely to standoff before next leg
-    move_backward_odometry(sensor, 14.0, DRIVE_SPEED, odometry_step_cb);
+    move_backward_tracked(sensor, 14.0, DRIVE_SPEED, odometry_step_cb);
     return 1;
 }
 
@@ -961,7 +1012,6 @@ int nav_approach_rack(oi_t *sensor, RackId rack, RackSide side)
 
 int nav_find_destination(oi_t *sensor)
 {
-    // If we already drove over the destination earlier, go straight there!
     if (dest_found)
     {
         uart_sendStr("DEST_KNOWN_RETURNING\r\n");
@@ -971,7 +1021,6 @@ int nav_find_destination(oi_t *sensor)
     uart_sendStr("SWEEPING_FOR_DEST\r\n");
     lcd_printf("Sweeping for\ndestination...");
 
-    // Sweep open aisle waypoints (lawnmower order across unvisited areas)
     const float sweep_pts[][2] = {
         { 90.0f,  131.0f },
         { 90.0f,  210.0f },
@@ -991,7 +1040,6 @@ int nav_find_destination(oi_t *sensor)
         float sx = sweep_pts[i][0];
         float sy = sweep_pts[i][1];
 
-        // Skip points outside current arena width or already visited
         if (sx > (ARENA_WIDTH_CM - 30.0f)) continue;
         if (grid[cm_to_row(sy)][cm_to_col(sx)] == CELL_VISITED) continue;
 
@@ -1016,14 +1064,12 @@ int nav_run_mission(oi_t *sensor,
 {
     uart_sendStr("MISSION_START\r\n");
 
-    // 1. Go to Rack 1 and pick up item 1
     if (!nav_approach_rack(sensor, rack1, side1))
     {
         uart_sendStr("MISSION_FAIL_RACK1\r\n");
         return 0;
     }
 
-    // 2. Find destination mat and drop off item 1
     if (!nav_find_destination(sensor))
     {
         uart_sendStr("MISSION_FAIL_DEST1\r\n");
@@ -1032,14 +1078,12 @@ int nav_run_mission(oi_t *sensor,
     uart_sendStr("DROPOFF_1_COMPLETE\r\n");
     timer_waitMillis(1000);
 
-    // 3. Go to Rack 2 and pick up item 2
     if (!nav_approach_rack(sensor, rack2, side2))
     {
         uart_sendStr("MISSION_FAIL_RACK2\r\n");
         return 0;
     }
 
-    // 4. Return directly to saved destination coordinates
     if (!nav_drive_to_coord(sensor, dest_x_cm, dest_y_cm, 1, 1))
     {
         uart_sendStr("MISSION_FAIL_DEST2\r\n");
@@ -1049,7 +1093,6 @@ int nav_run_mission(oi_t *sensor,
     uart_sendStr("MISSION_COMPLETE\r\n");
     lcd_printf("ORDER COMPLETE!\nAt Packing Bay");
 
-    // Audible completion alert on Roomba speaker
     unsigned char notes[4] = { 60, 64, 67, 72 };
     unsigned char dur[4]   = { 16, 16, 16, 32 };
     oi_loadSong(0, 4, notes, dur);
