@@ -38,10 +38,14 @@
 #define CLIFF_DEST_MAX        2100
 
 // Default calibration constants (also live-tunable over UART with 'k' commands!)
-// Run 't d 100' and 't a 90' / 't a -90' before test runs to verify accuracy.
-#define DEFAULT_MM_PER_CM_CAL     10.0f
-#define DEFAULT_ANGLE_SCALE_CW    1.00f
-#define DEFAULT_ANGLE_SCALE_CCW   1.00f
+// Calibrated from 100cm / 90deg / -90deg / 180deg lab test runs:
+//   100cm -> 101.5cm (mm/cm = 9.85), ~5 deg left veer (motor R = 0.98)
+//   90CW -> 93 deg & 180CW -> 187 deg (scale CW = 1.036), -90CCW -> 94 deg (scale CCW = 1.044)
+#define DEFAULT_MM_PER_CM_CAL     9.85f
+#define DEFAULT_ANGLE_SCALE_CW    1.036f
+#define DEFAULT_ANGLE_SCALE_CCW   1.044f
+#define DEFAULT_MOTOR_CAL_L       1.00f
+#define DEFAULT_MOTOR_CAL_R       0.98f
 #define DEFAULT_IMU_BLEND         0.20f  // 0.0 = pure encoders, 0.2 = 20% IMU sanity blend
 #define IMU_MAX_AGREE_DIFF_DEG    15.0f  // Ignore IMU on a turn if it disagrees by >15 deg
 

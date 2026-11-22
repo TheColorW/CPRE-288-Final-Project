@@ -91,6 +91,7 @@ int main(void)
 
     oi_t *sensor_data = oi_alloc();
     oi_init(sensor_data);
+    oi_setMotorCalibration((double)DEFAULT_MOTOR_CAL_L, (double)DEFAULT_MOTOR_CAL_R);
 
     // Initialize BNO055 in gyro+accel IMUPLUS mode (0x08) - NO magnetometer interference,
     // and NO blocking calibration dance! Used strictly as redundancy.
