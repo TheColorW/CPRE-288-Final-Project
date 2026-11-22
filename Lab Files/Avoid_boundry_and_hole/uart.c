@@ -16,7 +16,7 @@
 
 void uart_init(){
     SYSCTL_RCGCGPIO_R |= 0b10;
-    SYSCTL_RCGCUART_R = 0x02;
+    SYSCTL_RCGCUART_R |= 0x02;
     timer_waitMillis(1);                 // Small delay before accessing device after turning on clock
 
     GPIO_PORTB_AFSEL_R |= 0x03;

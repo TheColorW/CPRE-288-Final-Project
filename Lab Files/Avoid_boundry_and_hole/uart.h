@@ -23,6 +23,8 @@ void uart_sendChar(char data);
 
 char uart_receive(void);
 
+int uart_receive_nonblock(char *data);
+
 void uart_sendStr(const char *data);
 
 void uart_interrupt_init();

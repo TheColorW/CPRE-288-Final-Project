@@ -1,14 +1,26 @@
- /*
+/*
  * main.c
  *
  *  Created on: Oct 29, 2026
- *      Author: carlos28
+ *  Updated on: Nov 22, 2026
+ *      Authors: carlos28, jjaritz
+ *
+ * UART Commands (via PuTTY / GUI):
+ *   c            : Set pose to SW corner (22.5, 22.5) for Milestone 1 testing
+ *   g <x> <y>    : Drive to coordinate (x, y) in cm (e.g. "g 140 130")
+ *   l            : Localize automatically using two orthogonal white walls
+ *   r <id> <dir> : Approach rack (id 0=BL 1=TL 2=BR 3=TR, dir N/E/S/W, e.g. "r 0 W")
+ *   m <r1> <s1> <r2> <s2> : Run full 2-rack mission (e.g. "m 0 W 3 S")
+ *   s            : Run single 180-deg scan and print detected objects
+ *   p            : Print live cliff sensor values (use to calibrate destination paper!)
  */
 
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
+#include <inc/tm4c123gh6pm.h>
 #include "ping.h"
 #include "adc.h"
 #include "uart.h"
@@ -20,60 +32,40 @@
 #include "open_interface.h"
 #include "movement.h"
 #include "i2c.h"
-#include "bno055.h"
+#include "BNO055.h"
 #include "init_imu.h"
+#include "navigation.h"
 
+#define DELTA_THRESHOLD 35.0f
+#define DELTA_ERROR     35.0f
+#define MAX_DIST_CM     150.0f
+#define SERVO_STEP_MS   40
 
-#define SOUTH_HEADING   66.0f
-#define HEADING_TOL     .4f
-
-
-#define DELTA_THRESHOLD 40.0f
+#ifndef M_PI
 #define M_PI 3.14159265358979323846
-#define DELTA_ERROR 40.0f
-#define ANGLE_ERROR 2
-#define MAX_DIST_CM 150.0f
+#endif
 
-typedef struct {
-    int id;
-    int start_angle;
-    int end_angle;
-    int center_angle;
-    float distance;
-    int radial_width;
-    float linear_width;
-} Object;
-
-Object detected_objects[4]; // Array to hold detected objects
-Object smallest_object[1]; // Array holds smallest object for easy access
+ScanObject detected_objects[MAX_DETECTED_OBJECTS];
 int object_count = 0;
 
-void scan_field(void);
-void clean_data(void);
-void object_detect(float distance, int current_angle);
-void print_detected_objects(void);
-void wait_for_calibration(void);
-void turn_to_heading(oi_t *sensor_data, float target_deg);
+volatile char uart_data = 0;
 
-volatile int overflow_count;
-volatile int flag;
-volatile char uart_data;
+static float ping_raw_array[91];
+static float ping_cm_array[91];
+static float ir_raw_array[91];
+static float ir_cm_array[91];
 
-float sensor_data_array2_cleaned[91];
-float sensor_data_array2[91];
+int gap_angle = 90;
 
-float ir_data_array[91];
-float ir_data_array_clean[91];
+static void clean_data(void);
+static void object_detect(float distance, int current_angle);
+static void print_detected_objects(void);
+static void wait_for_calibration(void);
+static void uart_read_line(char *buf, int max_len);
+static int  parse_side_char(char c, RackSide *out_side);
 
-int gap_angle = 0;
-
-
-//void wait_for_calibration(void);
-//void turn_to_heading(oi_t *sensor_data, float target_deg);
-
-
-// I am working on getting the cybot to avoid objects (without the IMU)
-int main(void) {
+int main(void)
+{
     timer_init();
     adc_init();
     uart_init();
@@ -86,361 +78,409 @@ int main(void) {
     oi_init(sensor_data);
 
     init_imu();
-    set_imu_mode(0x0C);
+    set_imu_mode(0x0C); // NDOF fused orientation mode
 
-
-    //start by calibrating sensor
-    //then gui press start process
-    //Start by facing south, turn right and left, if one side seems not busy then get to an edge on the east or west side
+    // 1. Wait for BNO055 calibration
     wait_for_calibration();
 
+    // 2. Point robot SOUTH and press SW1 to lock arena cardinal axes
     float south_target = 180.0f;
-    while (button_getButton() != 1) {
+    while (button_getButton() != 1)
+    {
         bno055_convert_float_euler_h_deg(&south_target);
         lcd_printf("Point SOUTH &\npress SW1\nHeading: %.1f", south_target);
         timer_waitMillis(50);
     }
 
-    timer_waitMillis(3000);
-    lcd_printf("ready to start\n %.1f", south_target);
-    while(1) {
-        char gotByte = uart_receive();
+    nav_init(south_target);
+    // Default start pose = SW corner (safe for Milestone 1 corner testing)
+    nav_set_pose(22.5f, 22.5f);
 
-        if (gotByte == 'm') {
-            turn_to_heading(sensor_data, south_target);
-            lcd_printf("facing south\n %.1f", south_target);
-            timer_waitMillis(3000);
-            turn_to_heading(sensor_data, south_target - 90);
+    timer_waitMillis(500);
+    lcd_printf("Ready! S:%.1f\nWait UART cmd", south_target);
+    uart_sendStr("\r\n=== Warehouse Bot Ready ===\r\n");
+    uart_sendStr("Cmds: c | g X Y | l | r ID DIR | m R1 S1 R2 S2 | s | p\r\n");
+
+    char line[64];
+    while (1)
+    {
+        uart_read_line(line, sizeof(line));
+        if (line[0] == '\0')
+        {
+            continue;
+        }
+
+        char cmd = line[0];
+
+        if (cmd == 'c')
+        {
+            // Milestone 1 helper: place bot in bottom-left (SW) corner
+            nav_init(south_target);
+            nav_set_pose(22.5f, 22.5f);
+            uart_sendStr("POSE_SET_SW_CORNER 22.5 22.5\r\n");
+            lcd_printf("Pose: SW Corner\n(22.5, 22.5)");
+        }
+        else if (cmd == 'g')
+        {
+            // Drive to coordinate: "g <x> <y>"
+            float gx = 0.0f, gy = 0.0f;
+            if (sscanf(line + 1, "%f %f", &gx, &gy) == 2)
+            {
+                nav_drive_to_coord(sensor_data, gx, gy, 1, 0);
+            }
+            else
+            {
+                uart_sendStr("Usage: g <x_cm> <y_cm>\r\n");
+            }
+        }
+        else if (cmd == 'l')
+        {
+            // Automatic two-wall localization
+            nav_init(south_target);
+            nav_localize_two_walls(sensor_data);
+        }
+        else if (cmd == 'r')
+        {
+            // Approach single rack side: "r <0..3> <N|E|S|W>"
+            int rid = 0;
+            char sc = 'W';
+            RackSide side;
+            if (sscanf(line + 1, "%d %c", &rid, &sc) == 2 &&
+                rid >= 0 && rid <= 3 && parse_side_char(sc, &side))
+            {
+                nav_approach_rack(sensor_data, (RackId)rid, side);
+            }
+            else
+            {
+                uart_sendStr("Usage: r <0..3> <N|E|S|W>\r\n");
+            }
+        }
+        else if (cmd == 'm')
+        {
+            // Full mission: "m <r1> <s1> <r2> <s2>"
+            int r1 = 0, r2 = 3;
+            char c1 = 'W', c2 = 'S';
+            RackSide s1, s2;
+            if (sscanf(line + 1, "%d %c %d %c", &r1, &c1, &r2, &c2) == 4 &&
+                r1 >= 0 && r1 <= 3 && r2 >= 0 && r2 <= 3 &&
+                parse_side_char(c1, &s1) && parse_side_char(c2, &s2))
+            {
+                nav_run_mission(sensor_data, (RackId)r1, s1, (RackId)r2, s2);
+            }
+            else
+            {
+                uart_sendStr("Usage: m <r1> <s1> <r2> <s2> (e.g. m 0 W 3 S)\r\n");
+            }
+        }
+        else if (cmd == 's')
+        {
             scan_field();
-            turn_to_angle(sensor_data, gap_angle);
-            move_forward_until_stop(sensor_data, 100, 150);
+        }
+        else if (cmd == 'p')
+        {
+            // Print live cliff sensors (useful to calibrate destination mat)
+            char out[96];
+            oi_update(sensor_data);
+            sprintf(out, "CLIFF L:%u FL:%u FR:%u R:%u\r\n",
+                    sensor_data->cliffLeftSignal,
+                    sensor_data->cliffFrontLeftSignal,
+                    sensor_data->cliffFrontRightSignal,
+                    sensor_data->cliffRightSignal);
+            uart_sendStr(out);
+            lcd_printf("L:%u FL:%u\nFR:%u R:%u",
+                       sensor_data->cliffLeftSignal,
+                       sensor_data->cliffFrontLeftSignal,
+                       sensor_data->cliffFrontRightSignal,
+                       sensor_data->cliffRightSignal);
         }
     }
-
-
-
-    //  // Step 3: Drive forward using your existing movement function
-    //  double cm_driven = move_forward_until_stop(sensor_data, 250, 150);
-    //  lcd_printf("Stopped at %.1f cm\nFlag: %d", cm_driven, flag);
-
-    //  oi_free(sensor_data);
-    //  return 0;
-
 }
 
-
-// This function minimizes the code to save space
-// Both manual and autonomous scan and can't move while scanning
-void scan_field() {
-    servo_move(0.0); //makes sure scan starts from 0 degrees
-    timer_waitMillis(500);
-
-    // does the 180 degree scan
-
-    int i = 0;
-    int j = 0;
-
-
-    for(i; i<=180; i += 2) {
-        sensor_data_array2[i/2] = 0;
-        ir_data_array[i/2] = 0;
-        for(j = 0; j < 3; j++) {
-            servo_move(i); //moves servo to correct angle, next 2 lines do actual scanning...
-            sensor_data_array2[i/2] += (ping_read()/3.0);
-            ir_data_array[i/2] += (adc_read()/3.0);
+static void uart_read_line(char *buf, int max_len)
+{
+    int idx = 0;
+    while (idx < max_len - 1)
+    {
+        char ch = uart_receive();
+        if (ch == '\r' || ch == '\n')
+        {
+            if (idx == 0) continue; // Ignore stray CR/LF
+            break;
         }
-         timer_waitMillis(500);
+        buf[idx++] = ch;
     }
+    buf[idx] = '\0';
+}
+
+static int parse_side_char(char c, RackSide *out_side)
+{
+    switch (c)
+    {
+        case 'N': case 'n': *out_side = SIDE_NORTH; return 1;
+        case 'E': case 'e': *out_side = SIDE_EAST;  return 1;
+        case 'S': case 's': *out_side = SIDE_SOUTH; return 1;
+        case 'W': case 'w': *out_side = SIDE_WEST;  return 1;
+        default: return 0;
+    }
+}
+
+// Fast 180-degree IR + PING sweep (~3.5 s instead of 45 s)
+void scan_field(void)
+{
+    int i, j;
+
+    servo_move(0.0f);
+    timer_waitMillis(350);
+
+    for (i = 0; i <= 180; i += 2)
+    {
+        int idx = i / 2;
+        servo_move((float)i);
+        timer_waitMillis(SERVO_STEP_MS);
+
+        float ping_sum = 0.0f;
+        int ping_valid = 0;
+        float ir_sum = 0.0f;
+
+        for (j = 0; j < 3; j++)
+        {
+            int p = ping_read();
+            if (p > 0)
+            {
+                ping_sum += (float)p;
+                ping_valid++;
+            }
+            ir_sum += (float)adc_read();
+        }
+
+        ping_raw_array[idx] = (ping_valid > 0) ? (ping_sum / (float)ping_valid) : -1.0f;
+        ir_raw_array[idx]   = ir_sum / 3.0f;
+    }
+
+    servo_move(90.0f);
 
     clean_data();
 
-    i = 0;
-    object_count = 0; // object count reset to zero so that scan actually detects new objects**
-    for (i = 0; i < 91; i++) {
-        object_detect(ir_data_array_clean[i], i*2);
+    object_count = 0;
+    for (i = 0; i < 91; i++)
+    {
+        object_detect(ir_cm_array[i], i * 2);
     }
     print_detected_objects();
 }
 
-void clean_data(void) {
-    int i = 0;
-    int object_state = 0; // 0: not on object, 1: on object
-    int last_seg = 0;
-    float val = 0.0f;
-
-    for (i = 0; i < 91; i++) {
-        val = MAX_DIST_CM;
-        if (ir_data_array[i] > 0) {
-            val = pow((ir_data_array[i] / 18538), -1.225);
-            if (val > MAX_DIST_CM || val != val) val = MAX_DIST_CM;
+static void clean_data(void)
+{
+    int i;
+    for (i = 0; i < 91; i++)
+    {
+        float val = MAX_DIST_CM;
+        if (ir_raw_array[i] > 0.0f)
+        {
+            val = (float)pow((double)(ir_raw_array[i] / 18538.0f), -1.225);
+            if (val > MAX_DIST_CM || val != val)
+            {
+                val = MAX_DIST_CM;
+            }
         }
-        ir_data_array_clean[i] = val;
+        ir_cm_array[i] = val;
     }
 
-
-    float running_sum = ir_data_array_clean[0];
+    // Segment smoothing (bounds-safe!)
+    float running_sum = ir_cm_array[0];
     int segment_start = 0;
     int count = 1;
 
-    for(i = 1; i < 91; i++) {
-        float avg = running_sum / count;
-        if(fabs(ir_data_array_clean[i+1] - avg) > DELTA_ERROR) {
-            if(fabs(ir_data_array_clean[i+2] - avg) > DELTA_ERROR && i < 90){
-                int a;
-                for(a = segment_start; a <= i; a++) {
-                    ir_data_array_clean[a] = avg;
-                }
-                segment_start = i + 1;
-                running_sum = ir_data_array_clean[segment_start];
-                count = 1;
+    for (i = 1; i < 91; i++)
+    {
+        float avg = running_sum / (float)count;
+        if (i + 2 < 91 &&
+            fabsf(ir_cm_array[i + 1] - avg) > DELTA_ERROR &&
+            fabsf(ir_cm_array[i + 2] - avg) > DELTA_ERROR)
+        {
+            int a;
+            for (a = segment_start; a <= i; a++)
+            {
+                ir_cm_array[a] = avg;
             }
-        }else {
-            running_sum += ir_data_array_clean[i];
+            segment_start = i + 1;
+            running_sum = ir_cm_array[segment_start];
+            count = 1;
+        }
+        else
+        {
+            running_sum += ir_cm_array[i];
             count++;
         }
     }
 
-    for (i = 0; i < 91; i++) {
-        double pulse_ms = (double)sensor_data_array2[i] / 16000.0;
-        double distance_cm = (pulse_ms * 34.0) / 2.0;
-        sensor_data_array2_cleaned[i] = (float) distance_cm - 4; //subtraction is to account for error
+    // Flush final segment
+    if (count > 0)
+    {
+        float avg = running_sum / (float)count;
+        int a;
+        for (a = segment_start; a < 91; a++)
+        {
+            ir_cm_array[a] = avg;
+        }
     }
 
+    // Convert PING ticks to cm (handle timeouts cleanly)
+    for (i = 0; i < 91; i++)
+    {
+        if (ping_raw_array[i] <= 0.0f)
+        {
+            ping_cm_array[i] = MAX_DIST_CM;
+        }
+        else
+        {
+            double pulse_ms = (double)ping_raw_array[i] / 16000.0;
+            double distance_cm = (pulse_ms * 34.3) / 2.0 - 4.0;
+            if (distance_cm < 0.0) distance_cm = 0.0;
+            if (distance_cm > MAX_DIST_CM) distance_cm = MAX_DIST_CM;
+            ping_cm_array[i] = (float)distance_cm;
+        }
+    }
 }
 
-// This detects objects and adds them into an array where the data can be used to find the biggest gap (start and end angles)
-void object_detect(float distance, int current_angle){
+static void record_object(int start_angle, int end_angle)
+{
+    int radial_w = end_angle - start_angle;
+    if (radial_w < 4 || object_count >= MAX_DETECTED_OBJECTS)
+    {
+        return;
+    }
+
+    int center_angle = (start_angle + end_angle) / 2;
+    int cidx = center_angle / 2;
+    int lo = (cidx > 0) ? (cidx - 1) : 0;
+    int hi = (cidx < 90) ? (cidx + 1) : 90;
+
+    // Average neighboring PING samples safely within [0, 90]
+    float dist = (ping_cm_array[lo] + ping_cm_array[cidx] + ping_cm_array[hi]) / 3.0f;
+
+    detected_objects[object_count].id           = object_count + 1;
+    detected_objects[object_count].start_angle  = start_angle;
+    detected_objects[object_count].end_angle    = end_angle;
+    detected_objects[object_count].center_angle = center_angle;
+    detected_objects[object_count].radial_width = radial_w;
+    detected_objects[object_count].distance     = dist;
+
+    float theta_rad = (radial_w * (float)M_PI) / 180.0f;
+    detected_objects[object_count].linear_width = 2.0f * dist * sinf(theta_rad / 2.0f);
+
+    object_count++;
+}
+
+static void object_detect(float distance, int current_angle)
+{
     static int on_object = 0;
     static int start_angle = 0;
     static int prev_angle = 0;
-    static float prev_dist = -1.0f; // Initialized to invalid value to indicate no previous distance
-    static float dist_sum = 0.0f;
-    static int sample_count = 0;
-    float current_dist = distance;
+    static float prev_dist = MAX_DIST_CM;
 
-    if (current_angle == 0) {
-        on_object = 0;
+    if (current_angle == 0)
+    {
+        on_object = (distance < (MAX_DIST_CM - DELTA_THRESHOLD)) ? 1 : 0;
         start_angle = 0;
         prev_angle = 0;
         prev_dist = distance;
-        dist_sum = 0.0f;
-        sample_count = 0;
+        return;
     }
 
-    if (!on_object) {//check if we are currently on an object or not
-        // Look for a large enough distance drop to indicate the leading edge of an object
-        if ((prev_dist - current_dist) > DELTA_THRESHOLD) {
+    if (!on_object)
+    {
+        if ((prev_dist - distance) > DELTA_THRESHOLD)
+        {
             on_object = 1;
             start_angle = current_angle;
-            dist_sum = current_dist;
-            sample_count = 1;
         }
-    } else {
-        // Currently on an object
-        // Look for when distance jumps back up significantly
-        if ((current_dist - prev_dist) > DELTA_THRESHOLD) {
+    }
+    else
+    {
+        if ((distance - prev_dist) > DELTA_THRESHOLD)
+        {
             on_object = 0;
-            int end_angle = prev_angle; // The object ended at the previous angle
-            int radial_w = end_angle - start_angle;
-
-
-            // check if the angle detected is too small to be an object
-            if (radial_w >= 4 && object_count < 4) {
-                int center_angle = (start_angle + end_angle) / 2;
-
-                //use the sonar for more accurate distance, but use the IR to get the angle and width of the object
-                float dist = 0.0;
-                dist = (sensor_data_array2_cleaned[center_angle / 2 + 1] + sensor_data_array2_cleaned[center_angle / 2 -1 ]) / 2.0; //average the two closest readings to get a more accurate distance
-
-
-                detected_objects[object_count].id = object_count + 1; //update all object values in the struct
-                detected_objects[object_count].start_angle = start_angle;
-                detected_objects[object_count].end_angle = end_angle;
-                detected_objects[object_count].center_angle = center_angle;
-                detected_objects[object_count].radial_width = radial_w;
-                detected_objects[object_count].distance = dist;
-
-                // Calculate the linear width of the detected object
-                float theta_rad = (radial_w * M_PI) / 180.0;
-                detected_objects[object_count].linear_width = 2.0 * dist * sin(theta_rad / 2.0);
-
-                object_count++;
-            }
-        } else {
-            // Still on the object add all readings
-            dist_sum += current_dist;
-            sample_count++;
+            record_object(start_angle, prev_angle);
         }
     }
 
-    // Update history for next function call
-    prev_dist = current_dist;
+    prev_dist = distance;
     prev_angle = current_angle;
 
-    if(current_angle == 180) {//catches object if it is at the edge of the scan range
-        if (on_object) {
-            int end_angle = prev_angle; // The object ended at the previous angle
-            int radial_w = end_angle - start_angle;
-
-            // check if the angle detected is too small to be an object or max objects detected
-            if (radial_w >= 4 && object_count < 4) {
-
-                int center_angle = (start_angle + end_angle) / 2;
-
-                float dist = 0.0;
-                dist = (sensor_data_array2_cleaned[center_angle / 2 + 1] + sensor_data_array2_cleaned[center_angle / 2 -1 ]) / 2.0; //average the two closest readings to get a more accurate distance
-
-
-
-                detected_objects[object_count].id = object_count + 1; //update all object values in the struct
-                detected_objects[object_count].start_angle = start_angle;
-                detected_objects[object_count].end_angle = end_angle;
-                detected_objects[object_count].center_angle = center_angle;
-                detected_objects[object_count].radial_width = radial_w;
-                detected_objects[object_count].distance = dist;
-
-                // Calculate the linear width of the detected object
-                float theta_rad = (radial_w * M_PI) / 180.0;
-                detected_objects[object_count].linear_width = 2.0 * dist * sin(theta_rad / 2.0);
-
-                object_count++;
-            }
-        }
+    if (current_angle == 180 && on_object)
+    {
+        on_object = 0;
+        record_object(start_angle, prev_angle);
     }
 }
 
-//this function is to be changed into a gap finder, biggest gap takes the W (originally print_detected_objects)
-void print_detected_objects(void) {
-   char out[80];
-   uart_sendStr("Object#   Angle   Distance   Angular Width   Linear Width\n\r");
+static void print_detected_objects(void)
+{
+    char out[96];
+    uart_sendStr("Object#  Angle  Dist(cm)  AngWidth  LinWidth(cm)\r\n");
 
-   //int smallest_idx = -1;
-   //int min_radial = 181; // Initialize to maximum possible width
-   //float min_linear = 9999.0f;
+    int biggest_gap = 0;
+    int gap_center = 90;
+    int prev_end = 0;
+    int i;
 
-   int biggest_gap = 0;
-   int left_gap_idx = -1;
-   int right_gap_idx = -1;
-   int gap_center = 0;
+    for (i = 0; i < object_count; i++)
+    {
+        sprintf(out, "%-7d  %-5d  %-8.1f  %-8d  %-8.1f\r\n",
+                detected_objects[i].id,
+                detected_objects[i].center_angle,
+                detected_objects[i].distance,
+                detected_objects[i].radial_width,
+                detected_objects[i].linear_width);
+        uart_sendStr(out);
 
-   int i;
-   for (i = 0; i < object_count; i++) {
-       sprintf(out, "%-7d   %-5d   %-12.1f   %-16d   %-16.1f\n\r",
-               detected_objects[i].id, //goes back and prints all of the detected objects to putty
-               detected_objects[i].center_angle,
-               detected_objects[i].distance,
-               detected_objects[i].radial_width,
-               detected_objects[i].linear_width);
-       uart_sendStr(out);
+        int gap = detected_objects[i].start_angle - prev_end;
+        if (gap > biggest_gap)
+        {
+            biggest_gap = gap;
+            gap_center = prev_end + (gap / 2);
+        }
+        prev_end = detected_objects[i].end_angle;
+    }
 
-       if(i+1 < 4) { //this finds the biggest gap based on the amount of degrees between each object, and then finds the center of the gap
-           int current_gap = detected_objects[i+1].start_angle - detected_objects[i].end_angle;
-           if (current_gap > biggest_gap) {
-               biggest_gap = current_gap;
-               left_gap_idx = i;
-               right_gap_idx = i+1;
-               gap_center = detected_objects[right_gap_idx].start_angle - (biggest_gap/2); //this is where the bot should point to/turn to
-           }
-       }
-   }
+    // Check trailing gap from last object to 180 deg
+    int end_gap = 180 - prev_end;
+    if (end_gap > biggest_gap)
+    {
+        biggest_gap = end_gap;
+        gap_center = prev_end + (end_gap / 2);
+    }
 
-   sprintf(out, "the center gap is at the angle %d\n\r", gap_center);
-   uart_sendStr(out);
-   servo_move(gap_center); //moves the servo to gap
-   gap_angle = gap_center; //so the cybot can move in main
-
-//       if (detected_objects[i].linear_width < min_linear) { //calculates the smallest linear width and then prints out the object number, angle, and width to putty
-//           min_linear = detected_objects[i].linear_width;
-//           smallest_idx = i;
-//       }
-//   }
-//
-//   if (smallest_idx != -1) {
-//       // Print the smallest object's information
-//       float center_rad = detected_objects[smallest_idx].center_angle * M_PI / 180.0;
-//       int accurate_angle = (int)(atan2(14 + detected_objects[smallest_idx].distance * sin(center_rad),detected_objects[smallest_idx].distance * cos(center_rad)) * (180.0 / M_PI));
-//       smallest_object[0] = detected_objects[smallest_idx];
-//       smallest_object[0].center_angle = accurate_angle;
-//       sprintf(out, "\n\rSmallest length Object: #%d at %d deg (Width: %.2f cm), Accurate Angle: %d deg\n\r",
-//               detected_objects[smallest_idx].id,
-//               detected_objects[smallest_idx].center_angle,
-//               detected_objects[smallest_idx].linear_width,
-//               accurate_angle);
-//       cyBot_send_string(out);
-//       sprintf(test, "%f\n\r", smallest_object[0].distance);
-//       cyBot_send_string(test);
-//       servo_move(detected_objects[smallest_idx].center_angle); //move the servo to the angle of gap
-//   } else {
-//       cyBot_send_string("\n\rNo objects detected.\n\r");
-//       smallest_object[0].center_angle = 90; //these make sure that the cybot will not move in auto mode if no objects are detected
-//       smallest_object[0].distance = 0.0;
-//   }
+    gap_angle = (object_count == 0) ? 90 : gap_center;
+    sprintf(out, "GAP_CENTER %d (width %d deg)\r\n", gap_angle, biggest_gap);
+    uart_sendStr(out);
 }
 
-void wait_for_calibration(void){
+static void wait_for_calibration(void)
+{
     Calibration cal;
 
-
-    while (1) {
+    while (1)
+    {
         cal = calibrate_imu();
         lcd_printf("G:%d M:%d A:%d S:%d\nErr:%d",
                    cal.gyro, cal.magn, cal.accl, cal.syst, get_error());
 
-        // Gyro + Mag = 3 gives reliable compass heading on flat ground
-        if (cal.gyro == 3 && cal.magn == 3) {
+        if (cal.gyro == 3 && cal.magn == 3)
+        {
             break;
         }
 
-        // Safety override: press SW1 if indoor metal keeps Mag at 2
-        if (cal.gyro == 3 && button_getButton() == 1) {
+        // Override if indoor metal holds Mag at 2
+        if (cal.gyro == 3 && button_getButton() == 1)
+        {
             break;
         }
 
         timer_waitMillis(100);
     }
 
-    lcd_printf("IMU Ready!\nStarting turn...");
+    lcd_printf("IMU Ready!");
     timer_waitMillis(500);
 }
-
-
-void turn_to_heading(oi_t *sensor_data, float target_deg) {
-   float heading = 0.0f;
-   float error = 0.0f;
-   int16_t speed = 0;
-
-   while (1) {
-       // Read fused heading directly (0.0 to 360.0 deg, no quaternion.c needed)
-       bno055_convert_float_euler_h_deg(&heading);
-
-       // Compute shortest signed angle error in range [-180, +180]
-       error = target_deg - heading;
-       while (error > 180.0f)  error -= 360.0f;
-       while (error < -180.0f) error += 360.0f;
-
-       lcd_printf("Target: %.1f\nCurr:   %.1f\nErr:    %.1f",
-                  target_deg, heading, error);
-
-       // Stop once inside tolerance band
-       if (fabsf(error) <= HEADING_TOL) {
-           break;
-       }
-
-       // Two-stage speed control: fast turn when far, slow creep near target
-       speed = (fabsf(error) > 15.0f) ? 80 : 35;
-
-       if (error > 0.0f) {
-           // Need heading to increase -> turn clockwise
-           oi_setWheels(-speed, speed);
-       } else {
-           // Need heading to decrease -> turn counterclockwise
-           oi_setWheels(speed, -speed);
-       }
-
-       timer_waitMillis(15); // ~66 Hz update (BNO055 fuses at 100 Hz)
-   }
-
-   oi_setWheels(0, 0);
-   timer_waitMillis(150); // Let chassis settle before driving forward
-}
-

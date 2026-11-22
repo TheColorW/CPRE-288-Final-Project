@@ -48,10 +48,6 @@ int servo_move(float degrees) {
 
     int match_register = (int) falling_edge_time;
 
-    //print statements for debugging
-    printf("%f\n", actualMS);
-    printf("%f\n", falling_edge_time);
-
     //this sets the match registers up to the correct value based on falling edge time
     TIMER1_TBPMR_R = (match_register >> 16) & 0xFF;
     TIMER1_TBMATCHR_R = match_register & 0xFFFF;
