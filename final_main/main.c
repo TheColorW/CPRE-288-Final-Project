@@ -1,29 +1,27 @@
 /*
- * main.c
+ * final_main / main.c
  *
- *  Created on: Oct 29, 2026
- *  Updated on: Nov 22, 2026
- *      Authors: carlos28, jjaritz
+ * Assisted Manual Control for the Autonomous Warehouse Bot (CPRE 288).
+ * Keeps the familiar lab3_template structure (single-key PuTTY controls,
+ * scan_field, clean_data, object_detect, print_detected_objects, socketFix)
+ * while adding:
+ *   - Automatic safety stops on Bumpers, White Walls, Black Holes, & Final Destination
+ *   - Live BNO055 IMUPLUS (0x08, gyro+accel) compass heading & estimated (X, Y) HUD
+ *   - Fast ~3.5 s PING-primary 180-deg scan + 1-line ASCII radar bar
+ *   - Pickup & Delivery confirmation alerts + Roomba audio chimes
  *
- * Assumes robot starts in Bottom-Left (SW) corner (22.5, 22.5) facing NORTH (0 deg).
- * Wheel encoders are primary for driving/turning; BNO055 (IMUPLUS 0x08, gyro+accel)
- * is non-blocking redundancy only.
- *
- * UART Commands (via PuTTY / GUI):
- *   t d [cm]         : Distance calibration test (default 100 cm)
- *   t a [deg]        : Angle calibration test (+CW / -CCW, default 90 deg)
- *   t c              : Print current calibration scales + live sensor readings
- *   k d <mm_per_cm>  : Live-tune distance scale (default 10.0)
- *   k a <cw> <ccw>   : Live-tune CW & CCW angle scales (default 1.0 1.0)
- *   k m <L> <R>      : Live-tune left/right motor balance (default 1.0 1.0)
- *   k i <blend>      : Set IMU redundancy blend (0.0=off, 0.2=20% sanity blend)
- *   c                : Reset pose to SW corner (22.5, 22.5) facing North (0 deg)
- *   r <0..3> <L|R>   : Go to Left (L/W) or Right (R/E) (or N/S) of rack 0..3
- *                      (0=BL, 1=TL, 2=BR, 3=TR, e.g. "r 0 L" or "r 3 R")
- *   g <x> <y>        : Drive to coordinate (x, y) in cm
- *   m <r1><s1><r2><s2>: Full 2-rack mission (e.g. "m 0 L 3 R")
- *   s [r]            : 180-deg dual-sensor (IR+PING) scan ('s r' prints raw table)
- *   p                : Print live cliff sensor readings
+ * Single-Key PuTTY Controls (no Enter key needed):
+ *   q / w / e : Drive forward 5 cm / 20 cm / 45 cm (auto-stops on any hazard!)
+ *   s         : Drive backward 10 cm
+ *   a / d     : Turn Left / Right 15 deg
+ *   z / c     : Turn Left / Right 90 deg
+ *   x         : Turn around 180 deg
+ *   m         : Fast 180-deg scan (ASCII radar + object table + biggest gap)
+ *   i         : Status info (IMU heading, pos, front PING, all 4 cliff sensors)
+ *   p         : Confirm Rack Pickup (chime + counter)
+ *   f         : Confirm Drop-off / Order Complete (victory song on #2)
+ *   r         : Reset heading = 0 deg (North) & pos = (22.5, 22.5) SW corner
+ *   h         : Show controls help
  */
 
 #include <stdio.h>
@@ -31,56 +29,84 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
-#include <inc/tm4c123gh6pm.h>
-#include "ping.h"
-#include "adc.h"
-#include "uart.h"
 #include "Timer.h"
-#include "lcd.h"
-#include "servo.h"
-#include "button.h"
-#include "open_interface.h"
+#include "uart.h"
 #include "movement.h"
+#include "adc.h"
+#include "ping.h"
+#include "servo.h"
+#include "lcd.h"
+#include "button.h"
 #include "i2c.h"
-#include "BNO055.h"
+#include "bno055.h"
 #include "init_imu.h"
-#include "navigation.h"
-
-#define MAX_DIST_CM       150.0f
-#define DETECT_RANGE_CM   95.0f   // Any fused reading < 95 cm counts as an object
-#define EDGE_DROP_CM      22.0f   // Or a sudden drop > 22 cm
-#define SERVO_STEP_MS     35
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-ScanObject detected_objects[MAX_DETECTED_OBJECTS];
+#define MAX_OBJECTS     10
+#define MAX_DIST_CM     150.0f
+#define DETECT_RANGE_CM 95.0f
+#define EDGE_DROP_CM    22.0f
+#define SERVO_STEP_MS   35
+#define DRIVE_SPEED     140
+
+typedef struct {
+    int id;
+    int start_angle;
+    int end_angle;
+    int center_angle;
+    float distance;
+    int radial_width;
+    float linear_width;
+} Object;
+
+Object detected_objects[MAX_OBJECTS];
 int object_count = 0;
+
+float sensor_data_array2[91];
+float sensor_data_array2_cleaned[91];
+float ir_data_array[91];
+float ir_data_array_clean[91];
 
 volatile char uart_data = 0;
 
-// Shared scan arrays read by navigation.c for corridor collision checking
-float scan_ir_cm[SCAN_POINTS];
-float scan_ping_cm[SCAN_POINTS];
-float scan_fused_cm[SCAN_POINTS];
+// Pose & Mission Tracking (for blind-pilot HUD)
+static float imu_zero_deg = 0.0f;   // IMU reading when facing 0 deg (North/start)
+static float bot_x_cm     = 22.5f;  // Default SW corner X (cm)
+static float bot_y_cm     = 22.5f;  // Default SW corner Y (cm)
+static float bot_hdg_deg  = 0.0f;   // 0=N, 90=E, 180=S, 270=W
 
-static float ping_raw_array[SCAN_POINTS];
-static float ir_raw_array[SCAN_POINTS];
+static int   items_picked    = 0;
+static int   items_delivered = 0;
+static int   dest_found      = 0;
+static float dest_x_cm       = 0.0f;
+static float dest_y_cm       = 0.0f;
 
-int gap_angle = 90;
+// Function prototypes (matching lab3_template convention)
+void cyBot_send_string(const char *str);
+void scan_field(void);
+void clean_data(void);
+void object_detect(float distance, int current_angle);
+void print_detected_objects(void);
+void socketFix(void);
 
-static void clean_and_fuse_scan(void);
-static void detect_objects_fused(void);
-static void print_detected_objects(int verbose_raw);
-static void uart_read_line(char *buf, int max_len);
-static int  parse_side_char(char c, RackSide *out_side);
-static void run_distance_test(oi_t *sensor, float target_cm);
-static void run_angle_test(oi_t *sensor, float target_cw_deg);
-static void print_calibration_status(oi_t *sensor);
+// Manual-pilot helpers
+static void  print_help(void);
+static float get_heading_deg(void);
+static const char *heading_to_compass(float deg);
+static void  update_pose_from_move(float signed_cm);
+static void  drive_manual(oi_t *sensor, double cm);
+static void  turn_manual(oi_t *sensor, float delta_cw_deg);
+static void  print_hud(const char *status_msg);
+static void  print_full_status(oi_t *sensor);
+static void  play_beep_pickup(void);
+static void  play_beep_dest(void);
+static void  play_song_complete(void);
 
-int main(void)
-{
+int main(void) {
+    // Configure all devices (same order as working project)
     timer_init();
     adc_init();
     uart_init();
@@ -93,307 +119,294 @@ int main(void)
     oi_init(sensor_data);
     oi_setMotorCalibration((double)DEFAULT_MOTOR_CAL_L, (double)DEFAULT_MOTOR_CAL_R);
 
-    // Initialize BNO055 in gyro+accel IMUPLUS mode (0x08) - NO magnetometer interference,
-    // and NO blocking calibration dance! Used strictly as redundancy.
+    // Initialize BNO055 in gyro+accel IMUPLUS mode (0x08) - no magnetometer jumps!
     init_imu();
     set_imu_mode(BNO055_OPERATION_MODE_IMUPLUS);
     timer_waitMillis(100);
 
-    float test_h = 0.0f;
-    imu_enabled = (bno055_convert_float_euler_h_deg(&test_h) == 0) ? 1 : 0;
+    float h0 = 0.0f;
+    if (bno055_convert_float_euler_h_deg(&h0) == 0) {
+        imu_enabled = 1;
+        imu_zero_deg = normalize_deg(h0);
+    } else {
+        imu_enabled = 0;
+    }
 
-    // Start in Bottom-Left (SW) corner (22.5, 22.5) facing NORTH (0 deg)
-    nav_init_sw_corner();
     servo_move(90.0f);
+    bot_x_cm = 22.5f;
+    bot_y_cm = 22.5f;
+    bot_hdg_deg = 0.0f;
 
-    lcd_printf("SW Corner(22,22)\nFace NORTH IMU:%d\nWait UART cmd", imu_enabled);
-    uart_sendStr("\r\n=== Warehouse Bot Ready (SW Corner 22.5,22.5 Facing NORTH) ===\r\n");
-    uart_sendStr("Calibrate: 't d [cm]' | 't a [deg]' | 't c' | 'k d/a/m/i ...'\r\n");
-    uart_sendStr("Navigate : 'c' | 'r <0..3> <L|R>' | 'g X Y' | 'm R1 S1 R2 S2' | 's [r]' | 'p'\r\n");
+    lcd_printf("MANUAL PILOT\nIMU:%d Ready!\nWait PuTTY...", imu_enabled);
+    cyBot_send_string("\r\n========================================\r\n");
+    cyBot_send_string("  WAREHOUSE BOT - MANUAL PILOT READY!\r\n");
+    cyBot_send_string("========================================\r\n");
+    print_help();
+    print_hud("READY");
+    socketFix();
 
-    char line[80];
-    while (1)
-    {
-        uart_read_line(line, sizeof(line));
-        if (line[0] == '\0')
-        {
-            continue;
-        }
+    char got_Byte = 0;
 
-        char cmd = line[0];
+    while (1) {
+        if (uart_receive_nonblock(&got_Byte)) {
+            if (got_Byte == '\r' || got_Byte == '\n') {
+                continue;
+            }
 
-        if (cmd == 't')
-        {
-            // Calibration & pre-run accuracy checks
-            char sub = 0;
-            float val = 0.0f;
-            int n = sscanf(line + 1, " %c %f", &sub, &val);
-
-            if (n >= 1 && (sub == 'd' || sub == 'D'))
-            {
-                run_distance_test(sensor_data, (n >= 2 && val > 0.0f) ? val : 100.0f);
+            if (got_Byte == 'q' || got_Byte == 'Q') {
+                drive_manual(sensor_data, 5.0);
+                socketFix();
+            } else if (got_Byte == 'w' || got_Byte == 'W') {
+                drive_manual(sensor_data, 20.0);
+                socketFix();
+            } else if (got_Byte == 'e' || got_Byte == 'E') {
+                drive_manual(sensor_data, 45.0);
+                socketFix();
+            } else if (got_Byte == 's' || got_Byte == 'S') {
+                double moved = move_backward(sensor_data, 10.0, DRIVE_SPEED);
+                update_pose_from_move(-(float)moved);
+                print_hud("BACKED UP 10cm");
+                socketFix();
+            } else if (got_Byte == 'a' || got_Byte == 'A') {
+                turn_manual(sensor_data, -15.0f);
+                socketFix();
+            } else if (got_Byte == 'd' || got_Byte == 'D') {
+                turn_manual(sensor_data, 15.0f);
+                socketFix();
+            } else if (got_Byte == 'z' || got_Byte == 'Z') {
+                turn_manual(sensor_data, -90.0f);
+                socketFix();
+            } else if (got_Byte == 'c' || got_Byte == 'C') {
+                turn_manual(sensor_data, 90.0f);
+                socketFix();
+            } else if (got_Byte == 'x' || got_Byte == 'X') {
+                turn_manual(sensor_data, 180.0f);
+                socketFix();
+            } else if (got_Byte == 'm' || got_Byte == 'M') {
+                lcd_printf("Scanning 180...");
+                scan_field();
+                print_hud("SCAN DONE");
+                socketFix();
+            } else if (got_Byte == 'i' || got_Byte == 'I') {
+                print_full_status(sensor_data);
+                socketFix();
+            } else if (got_Byte == 'p' || got_Byte == 'P') {
+                char msg[96];
+                items_picked++;
+                play_beep_pickup();
+                sprintf(msg, "\r\n*** RACK PICKUP #%d CONFIRMED at (%.0f, %.0f) ***\r\n",
+                        items_picked, bot_x_cm, bot_y_cm);
+                cyBot_send_string(msg);
+                lcd_printf("PICKUP #%d!\nPos:%.0f,%.0f", items_picked, bot_x_cm, bot_y_cm);
+                socketFix();
+            } else if (got_Byte == 'f' || got_Byte == 'F') {
+                char msg[96];
+                items_delivered++;
+                if (items_delivered >= 2) {
+                    play_song_complete();
+                    sprintf(msg, "\r\n*** ORDER COMPLETE! (2/2 DELIVERED) ***\r\n");
+                    lcd_printf("ORDER COMPLETE!\n2/2 Delivered!");
+                } else {
+                    play_beep_dest();
+                    sprintf(msg, "\r\n*** DROP-OFF #%d CONFIRMED! Go to Rack #2 ***\r\n",
+                            items_delivered);
+                    lcd_printf("DROP-OFF #%d!\nGo to Rack #2", items_delivered);
+                }
+                cyBot_send_string(msg);
+                socketFix();
+            } else if (got_Byte == 'r' || got_Byte == 'R') {
+                float cur = 0.0f;
+                if (imu_read_heading_safe(&cur)) {
+                    imu_zero_deg = cur;
+                }
+                bot_x_cm = 22.5f;
+                bot_y_cm = 22.5f;
+                bot_hdg_deg = 0.0f;
+                items_picked = 0;
+                items_delivered = 0;
+                dest_found = 0;
+                cyBot_send_string("\r\n--- RESET: SW Corner (22.5, 22.5), HDG = 0.0 (N) ---\r\n");
+                print_hud("RESET");
+                socketFix();
+            } else if (got_Byte == 'h' || got_Byte == 'H') {
+                print_help();
+                socketFix();
             }
-            else if (n >= 1 && (sub == 'a' || sub == 'A'))
-            {
-                run_angle_test(sensor_data, (n >= 2 && val != 0.0f) ? val : 90.0f);
-            }
-            else if (n >= 1 && (sub == 'c' || sub == 'C'))
-            {
-                print_calibration_status(sensor_data);
-            }
-            else
-            {
-                uart_sendStr("Usage: t d [cm] | t a [deg] | t c\r\n");
-            }
-        }
-        else if (cmd == 'k')
-        {
-            // Live calibration adjustment without reflashing
-            char sub = 0;
-            float v1 = 0.0f, v2 = 0.0f;
-            int n = sscanf(line + 1, " %c %f %f", &sub, &v1, &v2);
-
-            if (n >= 2 && (sub == 'd' || sub == 'D') && v1 > 1.0f)
-            {
-                cal_mm_per_cm = v1;
-                char out[64];
-                sprintf(out, "SET cal_mm_per_cm = %.3f\r\n", cal_mm_per_cm);
-                uart_sendStr(out);
-            }
-            else if (n >= 2 && (sub == 'a' || sub == 'A') && v1 > 0.2f)
-            {
-                cal_angle_scale_cw = v1;
-                cal_angle_scale_ccw = (n >= 3 && v2 > 0.2f) ? v2 : v1;
-                char out[80];
-                sprintf(out, "SET cal_angle_scale CW=%.3f CCW=%.3f\r\n",
-                        cal_angle_scale_cw, cal_angle_scale_ccw);
-                uart_sendStr(out);
-            }
-            else if (n >= 3 && (sub == 'm' || sub == 'M'))
-            {
-                oi_setMotorCalibration((double)v1, (double)v2);
-                char out[64];
-                sprintf(out, "SET motor_cal L=%.3f R=%.3f\r\n", v1, v2);
-                uart_sendStr(out);
-            }
-            else if (n >= 2 && (sub == 'i' || sub == 'I'))
-            {
-                if (v1 < 0.0f) v1 = 0.0f;
-                if (v1 > 0.5f) v1 = 0.5f;
-                cal_imu_blend = v1;
-                char out[64];
-                sprintf(out, "SET cal_imu_blend = %.2f\r\n", cal_imu_blend);
-                uart_sendStr(out);
-            }
-            else
-            {
-                uart_sendStr("Usage: k d <mm/cm> | k a <cw> [ccw] | k m <L> <R> | k i <0..0.5>\r\n");
-            }
-        }
-        else if (cmd == 'c')
-        {
-            nav_init_sw_corner();
-            uart_sendStr("RESET_SW_CORNER (22.5, 22.5) bearing=0.0 (NORTH)\r\n");
-            lcd_printf("SW Corner(22,22)\nFacing NORTH");
-        }
-        else if (cmd == 'g')
-        {
-            float gx = 0.0f, gy = 0.0f;
-            if (sscanf(line + 1, "%f %f", &gx, &gy) == 2)
-            {
-                nav_drive_to_coord(sensor_data, gx, gy, 1, 0);
-            }
-            else
-            {
-                uart_sendStr("Usage: g <x_cm> <y_cm>\r\n");
-            }
-        }
-        else if (cmd == 'r')
-        {
-            // Go to Left (L/W) or Right (R/E) (or N/S) of any of the 4 racks
-            int rid = 0;
-            char sc = 'L';
-            RackSide side;
-            if (sscanf(line + 1, "%d %c", &rid, &sc) == 2 &&
-                rid >= 0 && rid <= 3 && parse_side_char(sc, &side))
-            {
-                nav_approach_rack(sensor_data, (RackId)rid, side);
-            }
-            else
-            {
-                uart_sendStr("Usage: r <0=BL|1=TL|2=BR|3=TR> <L|R|N|S> (e.g. r 0 L)\r\n");
-            }
-        }
-        else if (cmd == 'm')
-        {
-            int r1 = 0, r2 = 3;
-            char c1 = 'L', c2 = 'R';
-            RackSide s1, s2;
-            if (sscanf(line + 1, "%d %c %d %c", &r1, &c1, &r2, &c2) == 4 &&
-                r1 >= 0 && r1 <= 3 && r2 >= 0 && r2 <= 3 &&
-                parse_side_char(c1, &s1) && parse_side_char(c2, &s2))
-            {
-                nav_run_mission(sensor_data, (RackId)r1, s1, (RackId)r2, s2);
-            }
-            else
-            {
-                uart_sendStr("Usage: m <r1> <s1> <r2> <s2> (e.g. m 0 L 3 R)\r\n");
-            }
-        }
-        else if (cmd == 's')
-        {
-            char opt = 0;
-            int verbose = (sscanf(line + 1, " %c", &opt) == 1 && (opt == 'r' || opt == 'R'));
-            scan_field(verbose);
-        }
-        else if (cmd == 'p')
-        {
-            char out[96];
-            oi_update(sensor_data);
-            sprintf(out, "CLIFF L:%u FL:%u FR:%u R:%u\r\n",
-                    sensor_data->cliffLeftSignal,
-                    sensor_data->cliffFrontLeftSignal,
-                    sensor_data->cliffFrontRightSignal,
-                    sensor_data->cliffRightSignal);
-            uart_sendStr(out);
-            lcd_printf("L:%u FL:%u\nFR:%u R:%u",
-                       sensor_data->cliffLeftSignal,
-                       sensor_data->cliffFrontLeftSignal,
-                       sensor_data->cliffFrontRightSignal,
-                       sensor_data->cliffRightSignal);
         }
     }
 }
 
 // =========================================================================
-// Pre-Run Accuracy Tests (Distance & Angle Calibration)
+// Manual Driving & Turning with Automatic Safety Stops + HUD
 // =========================================================================
 
-static void run_distance_test(oi_t *sensor, float target_cm)
-{
-    char out[128];
-    float imu_drift = 0.0f;
+static void drive_manual(oi_t *sensor, double cm) {
+    char msg[128];
+    double moved = move_forward_until_stop(sensor, cm, DRIVE_SPEED);
+    update_pose_from_move((float)moved);
 
-    sprintf(out, "TEST_DIST %.1f cm (cal_mm_per_cm=%.3f)...\r\n", target_cm, cal_mm_per_cm);
-    uart_sendStr(out);
-    lcd_printf("Dist Test:\n%.0f cm", target_cm);
+    if (flag == MOVE_FLAG_NONE) {
+        sprintf(msg, "MOVED %.1fcm", moved);
+        print_hud(msg);
+        return;
+    }
 
-    double meas_cm = move_forward_tracked(sensor, target_cm, 140, 0, &imu_drift);
+    if (flag == MOVE_FLAG_DESTINATION) {
+        // Stop right on the destination mat (do NOT back up!)
+        dest_found = 1;
+        dest_x_cm = bot_x_cm;
+        dest_y_cm = bot_y_cm;
+        play_beep_dest();
+        sprintf(msg, "\r\n*** FINAL DESTINATION FOUND at (%.0f, %.0f) cm! ***\r\n",
+                dest_x_cm, dest_y_cm);
+        cyBot_send_string(msg);
+        lcd_printf("DESTINATION!\n(%.0f, %.0f) cm", dest_x_cm, dest_y_cm);
+        print_hud("ON DESTINATION!");
+        return;
+    }
 
-    sprintf(out, "DONE enc_cm=%.1f flag=%d imu_drift=%.1f deg\r\n",
-            meas_cm, flag, imu_drift);
-    uart_sendStr(out);
-    sprintf(out, "Measure tape! New scale = %.3f * (%.1f / actual_cm) -> 'k d <val>'\r\n",
-            cal_mm_per_cm, target_cm);
-    uart_sendStr(out);
-    lcd_printf("Dist:%.1fcm F:%d\nDrift:%.1f deg", meas_cm, flag, imu_drift);
+    // Any hazard (bump, white wall, or black hole): announce & back off 6 cm safely
+    const char *hazard_str = "HAZARD";
+    switch (flag) {
+        case MOVE_FLAG_BUMP_LEFT:  hazard_str = "!! BUMP LEFT (Fallen Box) !!";  break;
+        case MOVE_FLAG_BUMP_RIGHT: hazard_str = "!! BUMP RIGHT (Fallen Box) !!"; break;
+        case MOVE_FLAG_BUMP_BOTH:  hazard_str = "!! BUMP FRONT (Fallen Box) !!"; break;
+        case MOVE_FLAG_WALL_LEFT:  hazard_str = "!! WHITE WALL LEFT !!";         break;
+        case MOVE_FLAG_WALL_RIGHT: hazard_str = "!! WHITE WALL RIGHT !!";        break;
+        case MOVE_FLAG_WALL_FRONT: hazard_str = "!! WHITE WALL FRONT !!";        break;
+        case MOVE_FLAG_HOLE_LEFT:  hazard_str = "!! BLACK HOLE LEFT !!";         break;
+        case MOVE_FLAG_HOLE_RIGHT: hazard_str = "!! BLACK HOLE RIGHT !!";        break;
+        case MOVE_FLAG_HOLE_FRONT: hazard_str = "!! BLACK HOLE FRONT !!";        break;
+        default: break;
+    }
+
+    sprintf(msg, "\r\n%s (stopped at %.1f cm -> backing up 6 cm)\r\n", hazard_str, moved);
+    cyBot_send_string(msg);
+    lcd_printf("%s", hazard_str);
+
+    double backed = move_backward(sensor, 6.0, DRIVE_SPEED);
+    update_pose_from_move(-(float)backed);
+    print_hud(hazard_str);
 }
 
-static void run_angle_test(oi_t *sensor, float target_cw_deg)
-{
-    char out[128];
-    float enc_deg = 0.0f, imu_deg = 0.0f;
+static void turn_manual(oi_t *sensor, float delta_cw_deg) {
+    char msg[64];
+    float enc_d = 0.0f, imu_d = 0.0f;
+    float turned = turn_by_degrees(sensor, delta_cw_deg, &enc_d, &imu_d);
 
-    sprintf(out, "TEST_ANGLE %.1f deg (+CW/-CCW, scale CW=%.3f CCW=%.3f)...\r\n",
-            target_cw_deg, cal_angle_scale_cw, cal_angle_scale_ccw);
-    uart_sendStr(out);
-    lcd_printf("Angle Test:\n%.0f deg", target_cw_deg);
-
-    float blended = turn_by_degrees(sensor, target_cw_deg, &enc_deg, &imu_deg);
-
-    sprintf(out, "DONE enc=%.1f imu=%.1f blended=%.1f\r\n", enc_deg, imu_deg, blended);
-    uart_sendStr(out);
-    float old_s = (target_cw_deg >= 0.0f) ? cal_angle_scale_cw : cal_angle_scale_ccw;
-    sprintf(out, "Check protractor! New scale = %.3f * (actual_deg / %.1f) -> 'k a <cw> <ccw>'\r\n",
-            old_s, fabsf(target_cw_deg));
-    uart_sendStr(out);
-    lcd_printf("Enc:%.1f\nIMU:%.1f", enc_deg, imu_deg);
+    bot_hdg_deg = normalize_deg(bot_hdg_deg + turned);
+    sprintf(msg, "TURN %+.0fdeg (enc:%.1f imu:%.1f)", delta_cw_deg, enc_d, imu_d);
+    print_hud(msg);
 }
 
-static void print_calibration_status(oi_t *sensor)
-{
-    char out[128];
-    float h = 0.0f;
-    int h_ok = imu_read_heading_safe(&h);
+static float get_heading_deg(void) {
+    float raw_h = 0.0f;
+    if (imu_read_heading_safe(&raw_h)) {
+        bot_hdg_deg = normalize_deg(raw_h - imu_zero_deg);
+    }
+    return bot_hdg_deg;
+}
 
-    oi_update(sensor);
+static const char *heading_to_compass(float deg) {
+    deg = normalize_deg(deg);
+    if (deg >= 337.5f || deg < 22.5f)  return "N";
+    if (deg < 67.5f)                   return "NE";
+    if (deg < 112.5f)                  return "E";
+    if (deg < 157.5f)                  return "SE";
+    if (deg < 202.5f)                  return "S";
+    if (deg < 247.5f)                  return "SW";
+    if (deg < 292.5f)                  return "W";
+    return "NW";
+}
+
+static void update_pose_from_move(float signed_cm) {
+    float hdg = get_heading_deg();
+    float rad = hdg * ((float)M_PI / 180.0f);
+    // 0 deg = +Y (North), 90 deg = +X (East)
+    bot_x_cm += signed_cm * sinf(rad);
+    bot_y_cm += signed_cm * cosf(rad);
+}
+
+static void print_hud(const char *status_msg) {
+    char out[140];
+    float hdg = get_heading_deg();
+    const char *comp = heading_to_compass(hdg);
+
     servo_move(90.0f);
-    timer_waitMillis(150);
-    float p_cm = ping_read_cm();
+    timer_waitMillis(60);
+    float front_cm = ping_read_cm();
+
+    if (front_cm < 0.0f) {
+        sprintf(out, "[HDG:%5.1f (%-2s) | POS:(%3.0f,%3.0f) | FRONT: >150cm | %s]\r\n",
+                hdg, comp, bot_x_cm, bot_y_cm, status_msg);
+    } else {
+        sprintf(out, "[HDG:%5.1f (%-2s) | POS:(%3.0f,%3.0f) | FRONT:%5.1fcm | %s]\r\n",
+                hdg, comp, bot_x_cm, bot_y_cm, front_cm, status_msg);
+    }
+    cyBot_send_string(out);
+
+    lcd_printf("H:%.0f(%s) P:%.0f,%.0f\nF:%.0fcm %s",
+               hdg, comp, bot_x_cm, bot_y_cm,
+               (front_cm < 0.0f) ? 150.0f : front_cm, status_msg);
+}
+
+static void print_full_status(oi_t *sensor) {
+    char out[140];
+    oi_update(sensor);
+
+    float hdg = get_heading_deg();
+    const char *comp = heading_to_compass(hdg);
+
+    servo_move(90.0f);
+    timer_waitMillis(120);
+    float front_ping = ping_read_cm();
     int ir_raw = adc_read();
-    float ir_cm = (ir_raw > 0) ? (float)pow((double)((float)ir_raw / 18538.0f), -1.225) : MAX_DIST_CM;
+    float ir_cm = (ir_raw > 50) ? (float)pow((double)((float)ir_raw / 18538.0f), -1.225) : MAX_DIST_CM;
     if (ir_cm > MAX_DIST_CM || ir_cm != ir_cm) ir_cm = MAX_DIST_CM;
 
-    BotPose pos = nav_get_pose();
-
-    sprintf(out, "POSE x=%.1f y=%.1f bearing=%.1f\r\n", pos.x, pos.y, pos.bearing_deg);
-    uart_sendStr(out);
-    sprintf(out, "CAL mm/cm=%.3f angCW=%.3f angCCW=%.3f motL=%.2f motR=%.2f imuBlend=%.2f\r\n",
-            cal_mm_per_cm, cal_angle_scale_cw, cal_angle_scale_ccw,
-            (float)oi_getMotorCalibrationLeft(), (float)oi_getMotorCalibrationRight(),
-            cal_imu_blend);
-    uart_sendStr(out);
-    sprintf(out, "SENS PING=%.1fcm IR=%.1fcm(raw=%d) IMU=%s(%.1f) CLIFF=%u,%u,%u,%u\r\n",
-            p_cm, ir_cm, ir_raw, h_ok ? "OK" : "OFF", h,
+    cyBot_send_string("\r\n--- ROBOT STATUS ---\r\n");
+    sprintf(out, "Heading : %.1f deg (%s) [IMU:%s]\r\n",
+            hdg, comp, imu_enabled ? "ON" : "OFF");
+    cyBot_send_string(out);
+    sprintf(out, "Est Pos : (%.1f, %.1f) cm\r\n", bot_x_cm, bot_y_cm);
+    cyBot_send_string(out);
+    sprintf(out, "Front   : PING=%.1f cm | IR=%.1f cm (raw=%d)\r\n",
+            front_ping, ir_cm, ir_raw);
+    cyBot_send_string(out);
+    sprintf(out, "Cliffs  : L=%u  FL=%u  FR=%u  R=%u\r\n",
             sensor->cliffLeftSignal, sensor->cliffFrontLeftSignal,
             sensor->cliffFrontRightSignal, sensor->cliffRightSignal);
-    uart_sendStr(out);
+    cyBot_send_string(out);
+    sprintf(out, "Mission : Picked=%d/2 | Delivered=%d/2 | Dest=%s (%.0f,%.0f)\r\n",
+            items_picked, items_delivered,
+            dest_found ? "SAVED" : "not yet", dest_x_cm, dest_y_cm);
+    cyBot_send_string(out);
+}
+
+static void print_help(void) {
+    cyBot_send_string("Keys: [q]=5cm [w]=20cm [e]=45cm [s]=back10cm\r\n");
+    cyBot_send_string("      [a/d]=L/R 15deg  [z/c]=L/R 90deg  [x]=180deg\r\n");
+    cyBot_send_string("      [m]=Scan 180+Radar [i]=Full Status [p]=Pickup [f]=Finish [r]=Reset\r\n");
 }
 
 // =========================================================================
-// UART & Parsing Helpers
+// Fast 180-Degree Scan + ASCII Radar + Object Table (lab3_template style!)
 // =========================================================================
 
-static void uart_read_line(char *buf, int max_len)
-{
-    int idx = 0;
-    while (idx < max_len - 1)
-    {
-        char ch = uart_receive();
-        if (ch == '\r' || ch == '\n')
-        {
-            if (idx == 0) continue;
-            break;
-        }
-        buf[idx++] = ch;
-    }
-    buf[idx] = '\0';
-}
-
-// Accepts L/W (Left/West), R/E (Right/East), N (North), S (South)
-static int parse_side_char(char c, RackSide *out_side)
-{
-    switch (c)
-    {
-        case 'N': case 'n': *out_side = SIDE_NORTH; return 1;
-        case 'E': case 'e': case 'R': case 'r': *out_side = SIDE_EAST; return 1;
-        case 'S': case 's': *out_side = SIDE_SOUTH; return 1;
-        case 'W': case 'w': case 'L': case 'l': *out_side = SIDE_WEST; return 1;
-        default: return 0;
-    }
-}
-
-// =========================================================================
-// Dual-Sensor (IR + PING) Median-Filtered Scan & Object Detection
-// =========================================================================
-
-static float median3(float a, float b, float c)
-{
+static float median3(float a, float b, float c) {
     if (a > b) { float t = a; a = b; b = t; }
     if (b > c) { float t = b; b = c; c = t; }
     if (a > b) { float t = a; a = b; b = t; }
     return b;
 }
 
-void scan_field(int verbose_raw)
-{
+void scan_field(void) {
     int i, j;
 
     servo_move(0.0f);
     timer_waitMillis(300);
 
-    for (i = 0; i <= 180; i += 2)
-    {
+    for (i = 0; i <= 180; i += 2) {
         int idx = i / 2;
         servo_move((float)i);
         timer_waitMillis(SERVO_STEP_MS);
@@ -402,102 +415,80 @@ void scan_field(int verbose_raw)
         int ping_valid = 0;
         float ir_sum = 0.0f;
 
-        for (j = 0; j < 3; j++)
-        {
+        for (j = 0; j < 3; j++) {
             int p = ping_read();
-            if (p > 0)
-            {
+            if (p > 0) {
                 ping_sum += (float)p;
                 ping_valid++;
             }
             ir_sum += (float)adc_read();
         }
 
-        ping_raw_array[idx] = (ping_valid > 0) ? (ping_sum / (float)ping_valid) : -1.0f;
-        ir_raw_array[idx]   = ir_sum / 3.0f;
+        sensor_data_array2[idx] = (ping_valid > 0) ? (ping_sum / (float)ping_valid) : -1.0f;
+        ir_data_array[idx]      = ir_sum / 3.0f;
     }
 
     servo_move(90.0f);
 
-    clean_and_fuse_scan();
-    detect_objects_fused();
-    print_detected_objects(verbose_raw);
+    clean_data();
+
+    object_count = 0;
+    for (i = 0; i < 91; i++) {
+        object_detect(sensor_data_array2_cleaned[i], i * 2);
+    }
+
+    print_detected_objects();
 }
 
-static void clean_and_fuse_scan(void)
-{
-    float ir_tmp[SCAN_POINTS];
-    float ping_tmp[SCAN_POINTS];
+void clean_data(void) {
+    float ping_tmp[91];
+    float ir_tmp[91];
     int i;
 
-    for (i = 0; i < SCAN_POINTS; i++)
-    {
-        // IR raw -> cm
+    for (i = 0; i < 91; i++) {
+        // PING ticks -> cm (primary sensor, verified accurate in lab)
+        float pv = MAX_DIST_CM;
+        if (sensor_data_array2[i] > 0.0f) {
+            double pulse_ms = (double)sensor_data_array2[i] / 16000.0;
+            double distance_cm = (pulse_ms * 34.3) / 2.0 - 4.0;
+            if (distance_cm < 4.0) distance_cm = 4.0;
+            if (distance_cm > MAX_DIST_CM) distance_cm = MAX_DIST_CM;
+            pv = (float)distance_cm;
+        }
+        ping_tmp[i] = pv;
+
+        // IR raw -> cm (kept for close backup & telemetry)
         float iv = MAX_DIST_CM;
-        if (ir_raw_array[i] > 50.0f)
-        {
-            iv = (float)pow((double)(ir_raw_array[i] / 18538.0f), -1.225);
+        if (ir_data_array[i] > 50.0f) {
+            iv = (float)pow((double)(ir_data_array[i] / 18538.0f), -1.225);
             if (iv > MAX_DIST_CM || iv < 4.0f || iv != iv) iv = MAX_DIST_CM;
         }
         ir_tmp[i] = iv;
-
-        // PING ticks -> cm
-        float pv = MAX_DIST_CM;
-        if (ping_raw_array[i] > 0.0f)
-        {
-            double pulse_ms = (double)ping_raw_array[i] / 16000.0;
-            double d = (pulse_ms * 34.3) / 2.0 - 4.0;
-            if (d < 4.0) d = 4.0;
-            if (d > MAX_DIST_CM) d = MAX_DIST_CM;
-            pv = (float)d;
-        }
-        ping_tmp[i] = pv;
     }
 
-    // 3-point median filter preserves sharp thin pillars while killing single spikes
-    for (i = 0; i < SCAN_POINTS; i++)
-    {
+    // 3-point median filter kills spikes without erasing thin pillars
+    for (i = 0; i < 91; i++) {
         int prev = (i > 0) ? (i - 1) : 0;
-        int next = (i < SCAN_POINTS - 1) ? (i + 1) : (SCAN_POINTS - 1);
-
-        scan_ir_cm[i]   = median3(ir_tmp[prev],   ir_tmp[i],   ir_tmp[next]);
-        scan_ping_cm[i] = median3(ping_tmp[prev], ping_tmp[i], ping_tmp[next]);
-
-        // Fuse PING (primary, clean & accurate) + IR (only as ultra-close backup):
-        // Lab scan showed IR produces phantom 70-85 cm spikes in open space, while
-        // PING accurately measures 49-56 cm objects and 131-150 cm open space.
-        float pg_use = scan_ping_cm[i];
-        float ir_use = MAX_DIST_CM;
-        if (scan_ir_cm[i] < 48.0f && (pg_use < 95.0f || pg_use >= (MAX_DIST_CM - 5.0f)))
-        {
-            ir_use = scan_ir_cm[i];
-        }
-        scan_fused_cm[i] = (ir_use < pg_use) ? ir_use : pg_use;
+        int next = (i < 90) ? (i + 1) : 90;
+        sensor_data_array2_cleaned[i] = median3(ping_tmp[prev], ping_tmp[i], ping_tmp[next]);
+        ir_data_array_clean[i]        = median3(ir_tmp[prev],   ir_tmp[i],   ir_tmp[next]);
     }
 }
 
-static void record_object(int start_idx, int end_idx)
-{
-    int start_angle = start_idx * 2;
-    int end_angle   = end_idx * 2;
-    int radial_w    = end_angle - start_angle;
-
-    // Require at least 4 degrees (>= 3 samples) to ignore stray noise
-    if (radial_w < 4 || object_count >= MAX_DETECTED_OBJECTS)
-    {
+static void save_object(int start_angle, int end_angle) {
+    int radial_w = end_angle - start_angle;
+    if (radial_w < 4 || object_count >= MAX_OBJECTS) {
         return;
     }
 
     int center_angle = (start_angle + end_angle) / 2;
-
-    // Use minimum fused distance across the object's interior so we never underestimate proximity
+    int s_idx = start_angle / 2;
+    int e_idx = end_angle / 2;
     float min_d = MAX_DIST_CM;
     int k;
-    for (k = start_idx; k <= end_idx; k++)
-    {
-        if (scan_fused_cm[k] < min_d)
-        {
-            min_d = scan_fused_cm[k];
+    for (k = s_idx; k <= e_idx; k++) {
+        if (sensor_data_array2_cleaned[k] < min_d) {
+            min_d = sensor_data_array2_cleaned[k];
         }
     }
 
@@ -514,94 +505,95 @@ static void record_object(int start_idx, int end_idx)
     object_count++;
 }
 
-static void detect_objects_fused(void)
-{
-    object_count = 0;
-    int on_object = 0;
-    int start_idx = 0;
-    float obj_ref_dist = MAX_DIST_CM;
-    int i;
+void object_detect(float distance, int current_angle) {
+    static int on_object = 0;
+    static int start_angle = 0;
+    static int prev_angle = 0;
+    static float prev_dist = MAX_DIST_CM;
+    static float obj_ref = MAX_DIST_CM;
 
-    for (i = 0; i < SCAN_POINTS; i++)
-    {
-        float d = scan_fused_cm[i];
-        float prev_d = (i > 0) ? scan_fused_cm[i - 1] : MAX_DIST_CM;
+    if (current_angle == 0) {
+        on_object = (distance < DETECT_RANGE_CM) ? 1 : 0;
+        start_angle = 0;
+        prev_angle = 0;
+        prev_dist = distance;
+        obj_ref = distance;
+        return;
+    }
 
-        if (!on_object)
-        {
-            // Enter object if within DETECT_RANGE_CM OR sharp inward drop
-            if (d < DETECT_RANGE_CM || (prev_d - d) > EDGE_DROP_CM)
-            {
-                on_object = 1;
-                start_idx = i;
-                obj_ref_dist = d;
-            }
+    if (!on_object) {
+        if (distance < DETECT_RANGE_CM || (prev_dist - distance) > EDGE_DROP_CM) {
+            on_object = 1;
+            start_angle = current_angle;
+            obj_ref = distance;
         }
-        else
-        {
-            // Split if a second closer/farther object starts abruptly, or exit if open space
-            if (d >= (DETECT_RANGE_CM + 10.0f) || (d - obj_ref_dist) > EDGE_DROP_CM)
-            {
-                record_object(start_idx, i - 1);
-                on_object = 0;
-            }
-            else if ((obj_ref_dist - d) > EDGE_DROP_CM)
-            {
-                // Distinct closer object overlapped in front -> split cleanly
-                record_object(start_idx, i - 1);
-                start_idx = i;
-                obj_ref_dist = d;
-            }
-            else
-            {
-                // Smoothly track object surface distance
-                if (d < obj_ref_dist) obj_ref_dist = d;
-            }
+    } else {
+        if (distance >= (DETECT_RANGE_CM + 10.0f) || (distance - obj_ref) > EDGE_DROP_CM) {
+            on_object = 0;
+            save_object(start_angle, prev_angle);
+        } else if ((obj_ref - distance) > EDGE_DROP_CM) {
+            // Closer object overlapping in front -> split
+            save_object(start_angle, prev_angle);
+            start_angle = current_angle;
+            obj_ref = distance;
+        } else if (distance < obj_ref) {
+            obj_ref = distance;
         }
     }
 
-    if (on_object)
-    {
-        record_object(start_idx, SCAN_POINTS - 1);
+    prev_dist = distance;
+    prev_angle = current_angle;
+
+    if (current_angle == 180 && on_object) {
+        on_object = 0;
+        save_object(start_angle, prev_angle);
     }
 }
 
-static void print_detected_objects(int verbose_raw)
-{
-    char out[96];
+void print_detected_objects(void) {
+    char out[100];
+    int i;
 
-    if (verbose_raw)
-    {
-        int i;
-        uart_sendStr("Deg   IR(cm)  PING(cm)  Fused(cm)\r\n");
-        for (i = 0; i < SCAN_POINTS; i += 2)
-        {
-            sprintf(out, "%-4d  %-6.1f  %-8.1f  %-6.1f\r\n",
-                    i * 2, scan_ir_cm[i], scan_ping_cm[i], scan_fused_cm[i]);
-            uart_sendStr(out);
-        }
+    // 1. Visual 1-line ASCII Radar from LEFT (180 deg) to RIGHT (0 deg)
+    //    '#' = <30cm (VERY CLOSE)  'o' = 30-65cm  '.' = 65-95cm  '_' = CLEAR (>95cm)
+    cyBot_send_string("\r\nRADAR (Left 180 -> Front 90 -> Right 0): [#<30 o<65 .<95 _clear]\r\n");
+    char radar[52];
+    int rpos = 0;
+    for (i = 90; i >= 0; i -= 2) { // 46 chars covering 180..0 in 4-deg bins
+        float d = sensor_data_array2_cleaned[i];
+        if (d < 30.0f)      radar[rpos++] = '#';
+        else if (d < 65.0f) radar[rpos++] = 'o';
+        else if (d < 95.0f) radar[rpos++] = '.';
+        else                radar[rpos++] = '_';
     }
+    radar[rpos] = '\0';
+    sprintf(out, "[%s]\r\n", radar);
+    cyBot_send_string(out);
+    cyBot_send_string(" 180(L)       135        90(F)       45        0(R)\r\n");
 
-    uart_sendStr("Obj#  Angle  Dist(cm)  AngW  LinW(cm)\r\n");
+    // 2. Object Table (same format as lab3_template)
+    cyBot_send_string("Object#  Angle  Dist(cm)  AngW   LinW(cm)  Type?\r\n");
 
     int biggest_gap = 0;
     int gap_center = 90;
     int prev_end = 0;
-    int i;
 
-    for (i = 0; i < object_count; i++)
-    {
-        sprintf(out, "%-4d  %-5d  %-8.1f  %-4d  %-6.1f\r\n",
+    for (i = 0; i < object_count; i++) {
+        const char *guess = "Pillar";
+        if (detected_objects[i].linear_width >= 22.0f) guess = "RACK";
+        else if (detected_objects[i].linear_width >= 11.0f) guess = "Wide";
+
+        sprintf(out, "%-7d  %-5d  %-8.1f  %-5d  %-8.1f  %s\r\n",
                 detected_objects[i].id,
                 detected_objects[i].center_angle,
                 detected_objects[i].distance,
                 detected_objects[i].radial_width,
-                detected_objects[i].linear_width);
-        uart_sendStr(out);
+                detected_objects[i].linear_width,
+                guess);
+        cyBot_send_string(out);
 
         int gap = detected_objects[i].start_angle - prev_end;
-        if (gap > biggest_gap)
-        {
+        if (gap > biggest_gap) {
             biggest_gap = gap;
             gap_center = prev_end + (gap / 2);
         }
@@ -609,17 +601,51 @@ static void print_detected_objects(int verbose_raw)
     }
 
     int end_gap = 180 - prev_end;
-    if (end_gap > biggest_gap)
-    {
+    if (end_gap > biggest_gap) {
         biggest_gap = end_gap;
         gap_center = prev_end + (end_gap / 2);
     }
 
-    gap_angle = (object_count == 0) ? 90 : gap_center;
+    if (object_count == 0) {
+        cyBot_send_string("No objects within 95 cm - FRONT CLEAR!\r\n");
+    } else {
+        sprintf(out, "Biggest open gap: %d deg (width %d deg)\r\n", gap_center, biggest_gap);
+        cyBot_send_string(out);
+    }
+}
 
-    int hit_ang = -1;
-    float clear_fwd = nav_check_front_corridor_cm(100.0f, &hit_ang);
-    sprintf(out, "GAP %ddeg (w=%d) | CORRIDOR_CLEAR=%.1fcm (hit_ang=%d)\r\n",
-            gap_angle, biggest_gap, clear_fwd, hit_ang);
-    uart_sendStr(out);
+void cyBot_send_string(const char *str) {
+    while (*str != '\0') {
+        uart_sendChar(*str);
+        str++;
+    }
+}
+
+void socketFix(void) {
+    cyBot_send_string("end\n");
+}
+
+// =========================================================================
+// Audio Alerts (Bonus Capability!)
+// =========================================================================
+
+static void play_beep_pickup(void) {
+    unsigned char notes[2] = { 64, 71 };
+    unsigned char dur[2]   = { 12, 20 };
+    oi_loadSong(0, 2, notes, dur);
+    oi_play_song(0);
+}
+
+static void play_beep_dest(void) {
+    unsigned char notes[3] = { 67, 72, 76 };
+    unsigned char dur[3]   = { 12, 12, 24 };
+    oi_loadSong(1, 3, notes, dur);
+    oi_play_song(1);
+}
+
+static void play_song_complete(void) {
+    unsigned char notes[5] = { 60, 64, 67, 72, 76 };
+    unsigned char dur[5]   = { 12, 12, 12, 16, 32 };
+    oi_loadSong(2, 5, notes, dur);
+    oi_play_song(2);
 }
