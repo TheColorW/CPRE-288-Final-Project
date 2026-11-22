@@ -16,7 +16,7 @@
 
 
 void I2C_init(void){
-    SYSCTL_RCGCGPIO_R |= 0x01;
+    SYSCTL_RCGCGPIO_R |= 0x03;
     SYSCTL_RCGCI2C_R = 0x02;
     timer_waitMillis(1);                 // Small delay before accessing device after turning on clock
 
@@ -31,14 +31,15 @@ void I2C_init(void){
 
     //To initialize the GPIO for the rst and addr
 
-    SYSCTL_RCGCGPIO_R |= 0x02;
-    timer_waitMillis(1);
 
     GPIO_PORTB_DIR_R  |= 0xC0;   // PB6 and PB7 as outputs (0b1100_0000)
     GPIO_PORTB_DEN_R  |= 0xC0;   // Digital enable PB6 and PB7
 
     GPIO_PORTB_DATA_R &= ~0x80;  // PB7 = 0 -> Sets BNO055 I2C address to 0x28
-    GPIO_PORTB_DATA_R |= 0x40;   // PB6 = 1 -> Releases active-low Reset (RSTN)
+    GPIO_PORTB_DATA_R &= ~0x40;   // PB6 = 1 -> Releases active-low Reset (RSTN)
+    timer_waitMillis(2);
+    GPIO_PORTB_DATA_R |= 0x40; // release reset
+    timer_waitMillis(700);
 
 }
 static int I2C1_Wait_Done(void){
@@ -103,7 +104,7 @@ int I2C1_Read(int sAddr, uint8_t rAddr, uint8_t *data, uint8_t count){
         error = I2C1_Wait_Done();
         if(error) return -1;
 
-        data[0] = (uint8_t)(I2C1_MDR_R & 0xFF);
+        data[0] = (uint8_t) I2C1_MDR_R;
         error = I2C1_Wait_Done();
     }else {
         for (i = 0; i < count; i++) {

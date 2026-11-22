@@ -23,8 +23,8 @@
 #include "bno055.h"
 #include "init_imu.h"
 
-#define SOUTH_HEADING   180.0f
-#define HEADING_TOL     1.5f
+#define SOUTH_HEADING   66.0f
+#define HEADING_TOL     .4f
 
 
 volatile int overflow_count;
@@ -51,8 +51,19 @@ int main(void) {
     // Step 1: Calibrate (hold still 2s for Gyro, then spin 360 deg for Mag)
     wait_for_calibration();
 
+    float south_target = 180.0f;
+    while (button_getButton() != 1) {
+        bno055_convert_float_euler_h_deg(&south_target);
+        lcd_printf("Point SOUTH &\npress SW1\nHeading: %.1f", south_target);
+        timer_waitMillis(50);
+    }
+    timer_waitMillis(300);
+
+    timer_waitMillis(3000);
+
     // Step 2: Rotate to face South
-    turn_to_heading(sensor_data, SOUTH_HEADING);
+    turn_to_heading(sensor_data, south_target);
+
 
     // Step 3: Drive forward using your existing movement function
     double cm_driven = move_forward_until_stop(sensor_data, 250, 150);
@@ -69,8 +80,8 @@ void wait_for_calibration(void){
 
     while (1) {
         cal = calibrate_imu();
-        lcd_printf("Calibrating IMU\nG:%d M:%d A:%d S:%d\nSW1 to override",
-                   cal.gyro, cal.magn, cal.accl, cal.syst);
+        lcd_printf("G:%d M:%d A:%d S:%d\nErr:%d",
+                   cal.gyro, cal.magn, cal.accl, cal.syst, get_error());
 
         // Gyro + Mag = 3 gives reliable compass heading on flat ground
         if (cal.gyro == 3 && cal.magn == 3) {

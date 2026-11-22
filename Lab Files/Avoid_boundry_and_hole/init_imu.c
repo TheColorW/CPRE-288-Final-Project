@@ -52,6 +52,7 @@ void init_imu(void) {
 void set_imu_mode(uint8_t op_mode)
 {
   error = bno055_set_operation_mode(op_mode);
+  timer_waitMillis(25);
 }
 
 // struct bno055_euler_float_t get_abs_position()

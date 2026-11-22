@@ -5,13 +5,14 @@
  *      Author: carlos28
  */
 
-#ifndef BNO055_H_
-#define BNO055_H_
+#ifndef INIT_IMU_H_
+#define INIT_IMU_H_
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <inc/tm4c123gh6pm.h>
 #include "driverlib/interrupt.h"
+#include "bno055.h"
 
 
 typedef struct Calibration
@@ -31,9 +32,12 @@ int8_t _imu_i2c_write(uint8_t dev_address, uint8_t reg_address, uint8_t *var_dat
 
 void ms_delay(uint32_t ms);
 
-void init_imu(void);
-//struct bno055_euler_float_t get_abs_position();
+void set_imu_mode(uint8_t op_mode);
 
-Calibration calibrate_imu();
+int8_t get_error();
+
+void init_imu(void);
+
+Calibration calibrate_imu(void);
 
 #endif /* UART_H_ */
