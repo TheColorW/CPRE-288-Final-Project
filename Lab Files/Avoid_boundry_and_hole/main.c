@@ -463,11 +463,15 @@ static void clean_and_fuse_scan(void)
         scan_ir_cm[i]   = median3(ir_tmp[prev],   ir_tmp[i],   ir_tmp[next]);
         scan_ping_cm[i] = median3(ping_tmp[prev], ping_tmp[i], ping_tmp[next]);
 
-        // Fuse IR + PING conservatively so NEITHER thin pillars nor dark boxes are missed:
-        // - IR is trusted closely up to 80 cm (narrow beam catches thin PVC pillars)
-        // - PING is trusted across the full range (catches matte/angled boxes IR misses)
-        float ir_use = (scan_ir_cm[i] <= 80.0f) ? scan_ir_cm[i] : MAX_DIST_CM;
+        // Fuse PING (primary, clean & accurate) + IR (only as ultra-close backup):
+        // Lab scan showed IR produces phantom 70-85 cm spikes in open space, while
+        // PING accurately measures 49-56 cm objects and 131-150 cm open space.
         float pg_use = scan_ping_cm[i];
+        float ir_use = MAX_DIST_CM;
+        if (scan_ir_cm[i] < 48.0f && (pg_use < 95.0f || pg_use >= (MAX_DIST_CM - 5.0f)))
+        {
+            ir_use = scan_ir_cm[i];
+        }
         scan_fused_cm[i] = (ir_use < pg_use) ? ir_use : pg_use;
     }
 }

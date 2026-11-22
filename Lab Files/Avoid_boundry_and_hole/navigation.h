@@ -21,10 +21,10 @@
 // =========================================================================
 // Arena & Robot Geometry (cm)
 // =========================================================================
+// Measured arena: 462 cm (West -> East) x 262 cm (South -> North)
 // Bottom racks center Y = 31 (height 62 -> 0..62)
 // Top racks center Y = 231   (height 62 -> 200..262) => ARENA_HEIGHT_CM = 262
-// TODO: Measure exact total arena X width if different from 525 cm.
-#define ARENA_WIDTH_CM       525.0f
+#define ARENA_WIDTH_CM       462.0f
 #define ARENA_HEIGHT_CM      262.0f
 
 // Default starting pose: Bottom-Left (SW) corner facing North (+Y)
@@ -37,15 +37,15 @@
 #define RACK_HEIGHT_Y_CM     62.0f
 
 // Clearance inflation around racks/obstacles for grid planning
-#define OBSTACLE_INFLATE_CM  21.0f
+#define OBSTACLE_INFLATE_CM  24.0f
 // Center-to-rack-edge standoff before PING creep (28 - 17 = 11 cm bumper gap)
 #define RACK_STANDOFF_CM     28.0f
 // Final bumper-to-rack gap after PING creep ("within a few cm")
 #define RACK_FINAL_GAP_CM    6.0f
 
-// Occupancy grid dimensions (15 cm cells -> 35 x 18 = 630 cells)
+// Occupancy grid dimensions (15 cm cells -> 31 x 18 = 558 cells)
 #define CELL_SIZE_CM         15.0f
-#define GRID_COLS            35
+#define GRID_COLS            31
 #define GRID_ROWS            18
 
 // Cell state values

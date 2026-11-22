@@ -84,21 +84,32 @@ static int check_hazards(oi_t *sensor)
         return MOVE_FLAG_BUMP_RIGHT;
     }
 
-    // 2. White boundary tape (walls)
-    if (frontLeftCliff > CLIFF_WALL_THRESH || frontRightCliff > CLIFF_WALL_THRESH)
+#if ENABLE_DEST_DETECT
+    // 2. Final destination mat (MUST be checked BEFORE white wall because dest > white!)
+    if (leftCliff       > CLIFF_DEST_L_THRESH  ||
+        frontLeftCliff  > CLIFF_DEST_FL_THRESH ||
+        frontRightCliff > CLIFF_DEST_FR_THRESH ||
+        rightCliff      > CLIFF_DEST_R_THRESH)
+    {
+        return MOVE_FLAG_DESTINATION;
+    }
+#endif
+
+    // 3. White boundary tape (walls)
+    if (frontLeftCliff > CLIFF_WALL_FL_THRESH || frontRightCliff > CLIFF_WALL_FR_THRESH)
     {
         return MOVE_FLAG_WALL_FRONT;
     }
-    if (leftCliff > CLIFF_WALL_THRESH)
+    if (leftCliff > CLIFF_WALL_L_THRESH)
     {
         return MOVE_FLAG_WALL_LEFT;
     }
-    if (rightCliff > CLIFF_WALL_THRESH)
+    if (rightCliff > CLIFF_WALL_R_THRESH)
     {
         return MOVE_FLAG_WALL_RIGHT;
     }
 
-    // 3. Black holes (floor drops)
+    // 4. Black holes (floor drops)
     if (frontLeftCliff < CLIFF_HOLE_THRESH || frontRightCliff < CLIFF_HOLE_THRESH)
     {
         return MOVE_FLAG_HOLE_FRONT;
@@ -111,17 +122,6 @@ static int check_hazards(oi_t *sensor)
     {
         return MOVE_FLAG_HOLE_RIGHT;
     }
-
-#if ENABLE_DEST_DETECT
-    // 4. Destination paper on floor
-    if ((frontLeftCliff  >= CLIFF_DEST_MIN && frontLeftCliff  <= CLIFF_DEST_MAX) ||
-        (frontRightCliff >= CLIFF_DEST_MIN && frontRightCliff <= CLIFF_DEST_MAX) ||
-        (leftCliff       >= CLIFF_DEST_MIN && leftCliff       <= CLIFF_DEST_MAX) ||
-        (rightCliff      >= CLIFF_DEST_MIN && rightCliff      <= CLIFF_DEST_MAX))
-    {
-        return MOVE_FLAG_DESTINATION;
-    }
-#endif
 
     return MOVE_FLAG_NONE;
 }
@@ -251,12 +251,16 @@ float turn_by_degrees(oi_t *sensor, float delta_cw_deg,
     oi_update(sensor); // Flush stale encoder angle
 
     float turned_cw_deg = 0.0f;
+    // Stop TURN_COAST_LEAD_DEG early so chassis stopping coast lands right on target
+    float stop_at_deg = (target_abs > (TURN_COAST_LEAD_DEG + 3.0f))
+                        ? (target_abs - TURN_COAST_LEAD_DEG)
+                        : (target_abs * 0.65f);
     int stalled_ticks = 0;
     int ticks = 0;
 
-    while (fabsf(turned_cw_deg) < target_abs && ticks < 350)
+    while (fabsf(turned_cw_deg) < stop_at_deg && ticks < 350)
     {
-        float remaining = target_abs - fabsf(turned_cw_deg);
+        float remaining = stop_at_deg - fabsf(turned_cw_deg);
         // Two-stage speed minimizes stopping overshoot
         int16_t spd = (remaining > 18.0f) ? 100 : 40;
 

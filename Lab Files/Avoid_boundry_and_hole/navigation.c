@@ -26,12 +26,12 @@
 #define DRIVE_SPEED          140
 #define CREEP_SPEED          75
 #define MAX_BURST_CM         45.0f
-#define GOAL_TOL_CM          10.0f
+#define GOAL_TOL_CM          12.0f
 #define MAX_SCAN_MARK_CM     105.0f
-#define CORRIDOR_HALF_W_CM   (ROBOT_RADIUS_CM + 7.0f)  // 24 cm half-width
-#define FRONT_STOP_MARGIN_CM 16.0f
-#define DETOUR_SIDE_CM       38.0f
-#define DETOUR_PASS_CM       36.0f
+#define CORRIDOR_HALF_W_CM   (ROBOT_RADIUS_CM + 4.0f)  // 21 cm half-width
+#define FRONT_STOP_MARGIN_CM 15.0f
+#define DETOUR_SIDE_CM       36.0f
+#define DETOUR_PASS_CM       34.0f
 #define MAX_PATH_LEN         160
 
 typedef struct {
@@ -331,9 +331,10 @@ int nav_get_rack_target(RackId rack, RackSide side,
 // Scan-to-Map Projection & Direct Forward Corridor Clearance Check
 // =========================================================================
 
-// Inspects the raw fused scan array (IR + PING) for ANY obstacle lying inside
-// the robot's forward driving corridor (half-width = ROBOT_RADIUS + 7 cm).
-// Returns maximum safe forward travel distance in cm (0 if blocked right ahead).
+// Inspects the raw fused scan array (PING primary + close IR) for UNKNOWN
+// obstacles lying inside the robot's forward driving corridor.
+// Known rack surfaces and outside-arena walls are skipped so the robot does not
+// panic-detour away from the rack it is deliberately approaching or routing past.
 float nav_check_front_corridor_cm(float max_check_cm, int *out_hit_angle)
 {
     float safe_cm = max_check_cm;
@@ -341,7 +342,8 @@ float nav_check_front_corridor_cm(float max_check_cm, int *out_hit_angle)
     int idx;
 
     // Servo 0 = right, 90 = straight ahead, 180 = left
-    for (idx = 10; idx <= 80; idx++) // 20 deg .. 160 deg
+    // Check front cone 30 deg .. 150 deg (tighter than 20..160 to avoid wide PING side echoes)
+    for (idx = 15; idx <= 75; idx++) // 30 deg .. 150 deg
     {
         float d = scan_fused_cm[idx];
         if (d <= 4.0f || d > (max_check_cm + FRONT_STOP_MARGIN_CM))
@@ -356,6 +358,22 @@ float nav_check_front_corridor_cm(float max_check_cm, int *out_hit_angle)
 
         if (lat < CORRIDOR_HALF_W_CM)
         {
+            // Project point into arena coordinates to check if it belongs to a known rack
+            float ray_bearing = normalize_deg(bot_pose.bearing_deg + (90.0f - deg));
+            float rrad = DEG_TO_RAD(ray_bearing);
+            float ox = bot_pose.x + (d + 10.0f) * sinf(rrad);
+            float oy = bot_pose.y + (d + 10.0f) * cosf(rrad);
+
+            if (point_inside_any_rack(ox, oy, 14.0f))
+            {
+                continue; // Known rack (already planned around by BFS)
+            }
+            if (ox < 8.0f || ox > (ARENA_WIDTH_CM - 8.0f) ||
+                oy < 8.0f || oy > (ARENA_HEIGHT_CM - 8.0f))
+            {
+                continue; // Outside arena wall
+            }
+
             float allowable = fwd - FRONT_STOP_MARGIN_CM;
             if (allowable < 0.0f) allowable = 0.0f;
             if (allowable < safe_cm)
@@ -499,9 +517,9 @@ static int nav_detour_around_hazard(oi_t *sensor, int move_flag,
         move_backward_tracked(sensor, 15.0, DRIVE_SPEED, odometry_step_cb);
     }
 
-    // 2. Measure right (15..35 deg) vs left (145..165 deg) clearance with PING
-    float right_clear = quick_ping_sector_min(15, 35);
-    float left_clear  = quick_ping_sector_min(145, 165);
+    // 2. Measure true sideways clearance: Right (0..20 deg) vs Left (160..180 deg)
+    float right_clear = quick_ping_sector_min(0, 20);
+    float left_clear  = quick_ping_sector_min(160, 180);
 
     // Check map safety 38 cm to Right (+90 CW) vs Left (-90 CCW)
     float right_rad = DEG_TO_RAD(normalize_deg(orig_bearing + 90.0f));
@@ -880,8 +898,9 @@ int nav_drive_to_coord(oi_t *sensor, float goal_x, float goal_y,
 
         float burst = (seg_dist > MAX_BURST_CM) ? MAX_BURST_CM : seg_dist;
 
-        // 3. Scan forward hemisphere AND verify the direct driving corridor!
-        if (do_scans)
+        // 3. Scan forward hemisphere AND verify the direct driving corridor
+        // (Skip full 180-deg scan on final short <26 cm approach into a standoff point)
+        if (do_scans && dist_goal > 26.0f)
         {
             scan_field(0);
             mark_scanned_objects(goal_x, goal_y);
@@ -899,7 +918,7 @@ int nav_drive_to_coord(oi_t *sensor, float goal_x, float goal_y,
                 // Mark the blocking object in the grid
                 mark_corridor_blocker(hit_angle, blocker_d);
 
-                if (safe_cm < 18.0f)
+                if (safe_cm < 16.0f)
                 {
                     // Too close to drive straight -> actively sidestep around it!
                     int d_res = nav_detour_around_hazard(sensor, MOVE_FLAG_NONE, goal_x, goal_y);
@@ -1022,15 +1041,15 @@ int nav_find_destination(oi_t *sensor)
     lcd_printf("Sweeping for\ndestination...");
 
     const float sweep_pts[][2] = {
-        { 90.0f,  131.0f },
-        { 90.0f,  210.0f },
+        {  90.0f, 131.0f },
+        {  90.0f, 210.0f },
         { 262.0f, 210.0f },
         { 262.0f, 131.0f },
         { 262.0f,  55.0f },
-        { 430.0f,  55.0f },
-        { 430.0f, 131.0f },
-        { 430.0f, 210.0f },
-        { 90.0f,   55.0f }
+        { 415.0f,  55.0f },
+        { 415.0f, 131.0f },
+        { 415.0f, 210.0f },
+        {  90.0f,  55.0f }
     };
     const int num_pts = (int)(sizeof(sweep_pts) / sizeof(sweep_pts[0]));
     int i;
