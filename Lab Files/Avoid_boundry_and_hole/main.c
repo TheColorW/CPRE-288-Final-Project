@@ -61,6 +61,8 @@ float sensor_data_array2[91];
 float ir_data_array[91];
 float ir_data_array_clean[91];
 
+int gap_angle = 0;
+
 
 //void wait_for_calibration(void);
 //void turn_to_heading(oi_t *sensor_data, float target_deg);
@@ -77,24 +79,16 @@ int main(void) {
     oi_t *sensor_data = oi_alloc();
     oi_init(sensor_data);
 
-    scan_field();
+    while(1) {
+        char gotByte = uart_receive();
 
-//    // Initialize I2C1 + BNO055 and switch to 9-DOF sensor fusion
-//    init_imu();
-//    set_imu_mode(0x0C);
-//
-//    // Step 1: Calibrate (hold still 2s for Gyro, then spin 360 deg for Mag)
-//    wait_for_calibration();
-//
-//    // Step 2: Rotate to face South
-//    turn_to_heading(sensor_data, SOUTH_HEADING);
-//
-//    // Step 3: Drive forward using your existing movement function
-//    double cm_driven = move_forward_until_stop(sensor_data, 250, 150);
-//    lcd_printf("Stopped at %.1f cm\nFlag: %d", cm_driven, flag);
-//
-//    oi_free(sensor_data);
-    return 0;
+        if (gotByte == 'm') {
+            scan_field();
+            turn_to_angle(sensor_data, gap_angle);
+            move_forward_until_stop(sensor_data, 100, 150);
+        }
+    }
+
 }
 
 
@@ -124,6 +118,7 @@ void scan_field() {
     clean_data();
 
     i = 0;
+    object_count = 0; // object count reset to zero so that scan actually detects new objects**
     for (i = 0; i < 91; i++) {
         object_detect(ir_data_array_clean[i], i*2);
     }
@@ -280,12 +275,11 @@ void object_detect(float distance, int current_angle){
 //this function is to be changed into a gap finder, biggest gap takes the W (originally print_detected_objects)
 void print_detected_objects(void) {
    char out[80];
-   char test[10];
    uart_sendStr("Object#   Angle   Distance   Angular Width   Linear Width\n\r");
 
-   int smallest_idx = -1;
-   int min_radial = 181; // Initialize to maximum possible width
-   float min_linear = 9999.0f;
+   //int smallest_idx = -1;
+   //int min_radial = 181; // Initialize to maximum possible width
+   //float min_linear = 9999.0f;
 
    int biggest_gap = 0;
    int left_gap_idx = -1;
@@ -313,7 +307,10 @@ void print_detected_objects(void) {
        }
    }
 
-       servo_move(gap_center); //moves the servo to gap
+   sprintf(out, "the center gap is at the angle %d\n\r", gap_center);
+   uart_sendStr(out);
+   servo_move(gap_center); //moves the servo to gap
+   gap_angle = gap_center; //so the cybot can move in main
 
 //       if (detected_objects[i].linear_width < min_linear) { //calculates the smallest linear width and then prints out the object number, angle, and width to putty
 //           min_linear = detected_objects[i].linear_width;
